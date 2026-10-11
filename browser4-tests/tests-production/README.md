@@ -21,6 +21,9 @@ pwsh browser4-tests/tests-production/run-tests.ps1 all
 # Run smoke tests only
 pwsh browser4-tests/tests-production/run-tests.ps1 smoke
 
+# Run the server-free local command surface (no browser, no backend — ~1 min)
+pwsh browser4-tests/tests-production/run-tests.ps1 local
+
 # Run a single test
 pwsh browser4-tests/tests-production/run-tests.ps1 cli-basics
 
@@ -40,6 +43,7 @@ browser4-tests/tests-production/run-tests.sh smoke
 | Script | Category | Description |
 |---|---|---|
 | `cli-basics.ps1` | smoke | Basic CLI functionality (--version, --help, open, list, close) |
+| `local-commands.ps1` | local | Server-free local command surface (`config`, `skills`, `snapshot`, spaced-form contract) — no browser, no backend |
 | `agent-run-free-command.ps1` | agent | Agent free-command task lifecycle |
 | `agent-run-page-visit.ps1` | agent | Agent page-visit task lifecycle |
 | `agent-run-page-visit-interact.ps1` | agent | Agent page-visit + interaction task lifecycle |
