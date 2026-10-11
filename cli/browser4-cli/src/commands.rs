@@ -1761,7 +1761,7 @@ pub fn all_commands() -> Vec<CommandDef> {
                 OptionDef { name: "all", short: None, is_bool: true, description: "Show all snapshots including archived ones" },
             ],
             e2e_coverage: E2eCoverage::Excluded, // filesystem-only, no backend
-            tool_name_fn: |_| "snapshot_list".to_string(),
+            tool_name_fn: |_| String::new(),
             tool_params_fn: |args| {
                 let mut p = json!({});
                 for (k, v) in args {
@@ -1783,7 +1783,7 @@ pub fn all_commands() -> Vec<CommandDef> {
                 OptionDef { name: "dry-run", short: None, is_bool: true, description: "Show what would be deleted without actually deleting" },
             ],
             e2e_coverage: E2eCoverage::Excluded, // filesystem-only, no backend
-            tool_name_fn: |_| "snapshot_clean".to_string(),
+            tool_name_fn: |_| String::new(),
             tool_params_fn: |args| {
                 let mut p = json!({});
                 for (k, v) in args {
@@ -5906,7 +5906,18 @@ mod tests {
     fn test_local_only_commands_have_empty_tool_name() {
         let map = commands_map();
         let args = HashMap::new();
-        for name in ["diff-snapshot", "profiles-list", "profiler-start"] {
+        // Commands handled entirely in main.rs must not advertise an MCP tool:
+        // a non-empty name makes `--examples` ask the backend for a tool that
+        // does not exist, and it misleads any audit that derives "needs a
+        // backend" from this field.  Keep this list in sync with the local
+        // dispatch arms in main.rs.
+        for name in [
+            "diff-snapshot",
+            "profiles-list",
+            "profiler-start",
+            "snapshot-list",
+            "snapshot-clean",
+        ] {
             let cmd = map.get(name).unwrap();
             assert!(
                 (cmd.tool_name_fn)(&args).is_empty(),
