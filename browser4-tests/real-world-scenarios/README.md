@@ -88,11 +88,11 @@ Valid categories: `generic`, `browser4`, `real-world`, `mock-site`, `all` (defau
 
 ## Available tasks
 
-32 task files covering all browser4-cli commands documented in the SKILL reference plus the 5 built-in Browser4 plugins.
+47 task files covering all browser4-cli commands documented in the SKILL reference plus the 5 built-in Browser4 plugins.
 
 ### Real-World — Generic (`tasks/real-world/generic/`)
 
-7 scenarios requiring no browser4-specific knowledge. These can also be used to
+10 scenarios requiring no browser4-specific knowledge. These can also be used to
 evaluate other browser automation agents (Playwright, Puppeteer, Selenium, etc.).
 
 | Task file | Target | Scenario |
@@ -101,25 +101,30 @@ evaluate other browser automation agents (Playwright, Puppeteer, Selenium, etc.)
 | `visual-screenshot-controls.md` | Wikipedia | Resize viewport, scroll, wait, screenshot (full-page), PDF export |
 | `search-summary.md` | Baidu | Search for 武汉龙虾节, summarize findings |
 | `amazon.md` | Amazon | Search for whiteboard pens, compare top 4 |
-| `hacker-news.md` | Hacker News | Navigate HN, open and summarize top 3 posts |
 | `amazon-calabi-yau.md` | Amazon | Search for Calabi-Yau gift, shortlist 10, pick best |
 | `amazon-laser-engraved-crystal.md` | Amazon | Search for laser-engraved crystal gift, pick best |
+| `amazon-cell-phone-60-pages.md` | Amazon | Collect 60 pages of search results in parallel, export the HTML |
+| `hacker-news.md` | Hacker News | Navigate HN, open and summarize top 3 posts |
+| `bot-stealth-check-md.md` | Bot-detection services | Run 5 online detection services, report whether Browser4 looks human |
+| `qunar.md` | Qunar | 查询后天北京到上海的机票，找出最便宜的 3 个航班（无 `# heading`，中文提示词） |
 
 ### Real-World — Browser4 Specific (`tasks/real-world/browser4/`)
 
-10 scenarios exercising browser4-unique features (X-SQL, crawl, agent, loop,
-htmlsnapshot, attach, named sessions, auto-diff).
+18 scenarios (13 feature scenarios plus the 5 plugin scenarios listed below)
+exercising browser4-unique features (X-SQL, crawl, agent, loop, htmlsnapshot,
+attach, named sessions, auto-diff).
 
 | Task file | Target | Scenario |
 |-----------|--------|----------|
 | `session-management.md` | Wikipedia, HN | Open named sessions, switch between them, list/close all |
 | `snapshot-mastery.md` | Wikipedia | Full/interactive/scoped/depth-limited snapshots, auto-diff, grep with all flags |
 | `headed-window-visibility.md` | example.com | Headed session: the visible window must show the requested page (CDP target != about:blank), never a separate headless instance; headless must stay windowless; CLI warns only when a headed process lacks a window |
-| `html-snapshot-extraction.md` | books.toscrape.com | Capture HTML snapshot, get single/all values, export, summary, grep |
+| `dom-snapshot-extraction.md` | books.toscrape.com | Capture HTML snapshot, get single/all values, export, summary, grep |
 | `x-sql-query-methods.md` | books.toscrape.com | X-SQL via inline, @file, stdin, and base64; inspect for selector discovery |
 | `htmlsnapshot-inspect-discovery.md` | books.toscrape.com | HTML snapshot inspection and selector discovery workflow |
 | `tab-management.md` | Wikipedia, HN | Open, list, switch, and close multiple tabs across different sites |
 | `agent-extraction.md` | Wikipedia | extract with schema, summarize with --selector, agent run/status/result |
+| `agent-status-result-tracking.md` | Wikipedia | Full `agent run` → `status` → `result` → `list` lifecycle, terminal labels, `list --clear` |
 | `crawl-link-discovery.md` | books.toscrape.com | Crawl with link discovery, seed files, format/output options |
 | `loop-monitoring.md` | httpbin.org | Loop in plain-text/shell/subcommand modes, named loops, pause/resume/stop |
 | `attach-remote-debug.md` | Chrome/Edge CDP | Attach to running Chrome/Edge via CDP, capture state |
@@ -139,7 +144,7 @@ htmlsnapshot, attach, named sessions, auto-diff).
 
 ### Mock Site (`tasks/mock-site/`)
 
-13 scenarios requiring the local MockSite server (`./bin/test.ps1 mock-site`).
+19 scenarios requiring the local MockSite server (`./bin/test.ps1 mock-site`).
 
 | Task file | Scenario |
 |-----------|----------|
@@ -153,6 +158,12 @@ htmlsnapshot, attach, named sessions, auto-diff).
 | `swarm-parallel-scraping.md` | Swarm session, parallel X-SQL extraction, headless mode |
 | `storage-state-management.md` | Cookies (set with all flags), localStorage, sessionStorage, state-save/load |
 | `comprehensive-ecommerce-workflow.md` | End-to-end e-commerce research: 18 steps combining 15+ commands |
+| `network-observability.md` | `network requests/request/route/unroute`, HAR recording (`network har start/stop`) against the network fixture |
+| `console-errors-and-cdp.md` | `console`, `errors`, `dialog status`, raw `cdp` calls, and generic `tool call` passthrough |
+| `iframes-and-popups.md` | `frames` / `frame` scoping (including nested frames) and `window new` targets |
+| `file-upload-and-download.md` | `upload` (single + multi-file, error paths), `download --dir`, `wait --download` |
+| `device-and-network-emulation.md` | `set geo/offline/headers/media/device`, `delete data`, `resize` |
+| `element-assertions-and-focus.md` | `is visible/enabled/checked`, `check`/`uncheck`, `focus`, `scrollintoview`, `highlight`, `pushstate` |
 | `decision-tree/extraction-method-routing.md` | Decision-tree coverage for extraction choices: interact-first, get, get all, query, eval, extract, crawl |
 | `decision-tree/bulk-scale-routing.md` | Decision-tree coverage for bulk-routing choices: single page, crawl, swarm, loop, and few-URL shell loops |
 | `decision-tree/webminer-structuring-routing.md` | Decision-tree coverage for WebMiner routing: single-page export, crawl/swarm acquisition, free vs commercial tiers |
