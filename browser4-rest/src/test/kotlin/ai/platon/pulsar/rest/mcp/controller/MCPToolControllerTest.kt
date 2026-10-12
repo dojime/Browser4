@@ -1887,6 +1887,115 @@ class MCPToolControllerTest {
     }
 
     // =========================================================================
+    // A custom domain must not shadow the legacy names it merely prefixes
+    // =========================================================================
+
+    /**
+     * The `page` (formats) domain, with the same strictness as the real executor:
+     * only the methods it declared are answered, everything else is refused by
+     * name. That refusal is exactly what the dispatcher must never let a legacy
+     * tool name reach.
+     */
+    private fun registerPageFormatsDomain() {
+        val executor = object : AbstractToolExecutor() {
+            override val domain: String = "page"
+            override val receiverClass: kotlin.reflect.KClass<*> = Any::class
+            override suspend fun callFunctionOn(
+                domain: String, functionName: String, args: Map<String, Any?>, receiver: Any
+            ): Any? = when (functionName) {
+                "scrape" -> "scraped"
+                "formats" -> "formats"
+                else -> throw IllegalArgumentException("Unsupported page method: $functionName")
+            }
+        }
+        CustomToolRegistry.instance.register(executor)
+    }
+
+    @Test
+    fun `page_url is not shadowed by the registered page domain`() = runBlocking {
+        // The formats executor owns the "page" prefix but never declared `url`;
+        // before the guard it answered "Unsupported page method: url" and broke
+        // `snapshot` — and every other CLI read of the current URL — on all platforms.
+        registerPageFormatsDomain()
+        try {
+            `when`(agentToolManager.execute(any())).thenReturn(toolCallResult("https://example.com/"))
+
+            val request = MCPToolCallRequest(
+                tool = "page_url",
+                arguments = mapOf("sessionId" to sessionId)
+            )
+            val result = controller.callTool(request, response)
+
+            assertEquals(HttpStatus.OK, result.statusCode)
+            assertFalse(
+                result.body!!.isError,
+                "page_url must stay with the built-in tab tools, got: ${result.body!!.content[0].text}"
+            )
+            assertEquals("https://example.com/", result.body!!.content[0].text)
+
+            val captor = ArgumentCaptor.forClass(ToolCall::class.java)
+            Mockito.verify(agentToolManager).execute(capture(captor))
+            assertEquals("tab", captor.value.domain)
+            assertEquals("currentUrl", captor.value.method)
+        } finally {
+            CustomToolRegistry.instance.unregister("page")
+        }
+    }
+
+    @Test
+    fun `page_title is not shadowed by the registered page domain`() = runBlocking {
+        registerPageFormatsDomain()
+        try {
+            `when`(agentToolManager.execute(any())).thenReturn(toolCallResult("Example Domain"))
+
+            val request = MCPToolCallRequest(
+                tool = "page_title",
+                arguments = mapOf("sessionId" to sessionId)
+            )
+            val result = controller.callTool(request, response)
+
+            assertEquals(HttpStatus.OK, result.statusCode)
+            assertFalse(
+                result.body!!.isError,
+                "page_title must stay with the built-in tab tools, got: ${result.body!!.content[0].text}"
+            )
+            assertEquals("Example Domain", result.body!!.content[0].text)
+
+            val captor = ArgumentCaptor.forClass(ToolCall::class.java)
+            Mockito.verify(agentToolManager).execute(capture(captor))
+            assertEquals("tab", captor.value.domain)
+            assertEquals("title", captor.value.method)
+        } finally {
+            CustomToolRegistry.instance.unregister("page")
+        }
+    }
+
+    @Test
+    fun `page_scrape still dispatches to the registered page domain`() = runBlocking {
+        // The other half of the invariant: the guard keeps legacy names with the
+        // built-in tools, it must not divert the domain's own tools.
+        registerPageFormatsDomain()
+        try {
+            val request = MCPToolCallRequest(
+                tool = "page_scrape",
+                arguments = mapOf("sessionId" to sessionId)
+            )
+            val result = controller.callTool(request, response)
+
+            assertEquals(HttpStatus.OK, result.statusCode)
+            assertFalse(
+                result.body!!.isError,
+                "page_scrape must reach the formats executor, got: ${result.body!!.content[0].text}"
+            )
+            assertEquals("scraped", result.body!!.content[0].text)
+            Mockito.verify(agentToolManager, Mockito.never()).execute(any())
+            Unit
+        } finally {
+            CustomToolRegistry.instance.unregister("page")
+        }
+    }
+
+    // =========================================================================
     // toMcpToolName ↔ extractDomain round-trip
     // =========================================================================
 

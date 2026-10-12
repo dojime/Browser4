@@ -259,6 +259,59 @@ class MCPToolController(
             "browser_frame_main" to "frame_main",
         )
 
+        /**
+         * Legacy/special tool names the dispatcher resolves itself, mapped to the
+         * canonical `(domain, method)` each one stands for.
+         *
+         * Two places read this table, which is what keeps them from drifting apart:
+         *
+         * - [resolveMcpToolCall] applies it explicitly, so these names resolve even
+         *   when `ToolSpecGenerator` cannot read `WebDriver.kt` from the classpath
+         *   (e.g. running from a JAR in CI);
+         * - [dispatchToToolExecutor] refuses to hand them to a custom-domain
+         *   executor. A registered domain only *looks* like it owns the name:
+         *   `page_url` / `page_title` share their prefix with the registered `page`
+         *   (formats) domain, whose executor never declared them and answered
+         *   "Unsupported page method: url" — breaking `snapshot` and every other CLI
+         *   read of the page URL.
+         */
+        private val LEGACY_TOOL_TARGETS: Map<String, Pair<String, String>> = mapOf(
+            "navigate" to ("tab" to "navigate"),
+            "reload" to ("tab" to "reload"),
+            "go_back" to ("tab" to "goBack"),
+            "go_forward" to ("tab" to "goForward"),
+            "page_title" to ("tab" to "title"),
+            "page_url" to ("tab" to "currentUrl"),
+            "switch_tab" to ("browser" to "switchTab"),
+            "tab_select" to ("browser" to "switchTab"),
+            "tab_new" to ("browser" to "newTab"),
+            "tab_list" to ("browser" to "listTabs"),
+            "tab_close" to ("browser" to "closeTab"),
+            "close_tab" to ("browser" to "closeTab"),
+            "keydown" to ("tab" to "keyDown"),
+            "keyup" to ("tab" to "keyUp"),
+            "mousemove" to ("tab" to "mouseMove"),
+            "mousedown" to ("tab" to "mouseDown"),
+            "mouseup" to ("tab" to "mouseUp"),
+            "mousewheel" to ("tab" to "mouseWheel"),
+            "consoleMessages" to ("tab" to "consoleMessages"),
+            "consoleClear" to ("tab" to "consoleClear"),
+            "focus" to ("tab" to "focus"),
+            "is_visible" to ("tab" to "isVisible"),
+            "is_enabled" to ("tab" to "isEnabled"),
+            "is_checked" to ("tab" to "isChecked"),
+            "dialog_status" to ("tab" to "dialogStatus"),
+            "network_requests" to ("tab" to "networkRequests"),
+            "network_request" to ("tab" to "networkRequestDetail"),
+            "network_route" to ("tab" to "networkRoute"),
+            "network_unroute" to ("tab" to "networkUnroute"),
+            "har_start" to ("tab" to "harStart"),
+            "har_stop" to ("tab" to "harStop"),
+            "frame_list" to ("tab" to "frameList"),
+            "frame_switch" to ("tab" to "frameSwitch"),
+            "frame_main" to ("tab" to "frameMain"),
+        )
+
         private const val CLEAR_SESSION_STORAGE_SCRIPT = """
             (() => {
                 const result = {
@@ -1042,9 +1095,17 @@ class MCPToolController(
         val toolName = normalizedRequest.tool
         val args = normalizeToolArguments(toolName, normalizedRequest.arguments)
 
-        // Extract domain from tool name and try CustomToolRegistry
+        // Extract domain from tool name and try CustomToolRegistry.
+        //
+        // A registered domain must not shadow a legacy name the dispatcher itself
+        // resolves ([LEGACY_TOOL_TARGETS]): `page_url` / `page_title` share their
+        // prefix with the registered `page` (formats) domain, so the registry lookup
+        // claimed them for an executor that never declared them — answering
+        // "Unsupported page method: url" and failing every CLI read of the page URL
+        // (`snapshot` first). Those names stay with the built-in agent tools.
         val domain = extractDomain(toolName)
         val customExecutor = CustomToolRegistry.instance.get(domain)
+            ?.takeUnless { toolName in LEGACY_TOOL_TARGETS }
 
         // Reject malformed calls before any dispatch, with the same rules (and
         // codes) the standard MCP server applies.
@@ -1654,40 +1715,10 @@ class MCPToolController(
         // Also includes essential tools whose specs are normally auto-generated from
         // @MCP-annotated WebDriver methods — the explicit entries ensure they resolve
         // even when ToolSpecGenerator cannot read WebDriver.kt from the classpath
-        // (e.g. running from a JAR in CI).
-        when (toolName) {
-            "navigate" -> return ToolCall("tab", "navigate", args1)
-            "reload" -> return ToolCall("tab", "reload", args1)
-            "go_back" -> return ToolCall("tab", "goBack", args1)
-            "go_forward" -> return ToolCall("tab", "goForward", args1)
-            "page_title" -> return ToolCall("tab", "title", args1)
-            "page_url" -> return ToolCall("tab", "currentUrl", args1) // or just rely on pageUrl if it exists
-            "switch_tab", "tab_select" -> return ToolCall("browser", "switchTab", args1)
-            "tab_new" -> return ToolCall("browser", "newTab", args1)
-            "tab_list" -> return ToolCall("browser", "listTabs", args1)
-            "tab_close", "close_tab" -> return ToolCall("browser", "closeTab", args1)
-            "keydown" -> return ToolCall("tab", "keyDown", args1)
-            "keyup" -> return ToolCall("tab", "keyUp", args1)
-            "mousemove" -> return ToolCall("tab", "mouseMove", args1)
-            "mousedown" -> return ToolCall("tab", "mouseDown", args1)
-            "mouseup" -> return ToolCall("tab", "mouseUp", args1)
-            "mousewheel" -> return ToolCall("tab", "mouseWheel", args1)
-            "consoleMessages" -> return ToolCall("tab", "consoleMessages", args1)
-            "consoleClear" -> return ToolCall("tab", "consoleClear", args1)
-            "focus" -> return ToolCall("tab", "focus", args1)
-            "is_visible" -> return ToolCall("tab", "isVisible", args1)
-            "is_enabled" -> return ToolCall("tab", "isEnabled", args1)
-            "is_checked" -> return ToolCall("tab", "isChecked", args1)
-            "dialog_status" -> return ToolCall("tab", "dialogStatus", args1)
-            "network_requests" -> return ToolCall("tab", "networkRequests", args1)
-            "network_request" -> return ToolCall("tab", "networkRequestDetail", args1)
-            "network_route" -> return ToolCall("tab", "networkRoute", args1)
-            "network_unroute" -> return ToolCall("tab", "networkUnroute", args1)
-            "har_start" -> return ToolCall("tab", "harStart", args1)
-            "har_stop" -> return ToolCall("tab", "harStop", args1)
-            "frame_list" -> return ToolCall("tab", "frameList", args1)
-            "frame_switch" -> return ToolCall("tab", "frameSwitch", args1)
-            "frame_main" -> return ToolCall("tab", "frameMain", args1)
+        // (e.g. running from a JAR in CI). The same table keeps a custom domain from
+        // claiming these names in [dispatchToToolExecutor].
+        LEGACY_TOOL_TARGETS[toolName]?.let { (legacyDomain, method) ->
+            return ToolCall(legacyDomain, method, args1)
         }
 
         // 2. Generic mapping
