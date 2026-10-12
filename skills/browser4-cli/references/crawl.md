@@ -7,8 +7,7 @@ tier: procedure
 # Crawl Command Reference
 
 Recursive website crawling — start from a URL or seed file, follow links up to
-a configurable depth, and optionally extract structured data from each page
-with X-SQL.
+a configurable depth, and optionally extract structured data from each page with X-SQL.
 
 ## Quick start
 
@@ -388,8 +387,7 @@ completed *with errors*: it prints `Summary: ok: <n>, failed: <m>`, records `pag
 its JSON, stores the local task as `partial failure (<ok> of <pages> pages ok)` and exits
 **6** (`PartialFailure`).  Exit 0 stays reserved for a crawl where nothing failed; in `--json`
 mode the failure path emits the error envelope, which carries no accumulated fields, so the
-counts arrive only inside `error.message` — `pages_failed` is present on the success path,
-where it is `0`.
+counts arrive only inside `error.message` — `pages_failed` is present on the success path, where it is `0`.
 
 ## Rate Limiting & Polite Scraping
 
