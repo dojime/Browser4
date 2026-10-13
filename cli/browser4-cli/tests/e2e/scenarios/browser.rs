@@ -4864,10 +4864,29 @@ pub(super) fn test_scrape_formats(ctx: &mut E2ECtx) {
     let path = json_string_field(mixed_doc, "screenshot")
         .unwrap_or_else(|| panic!("no screenshot path in:\n{mixed_doc}"));
     assert!(path.ends_with(".png"), "expected a png path, got {path}");
-    assert!(
-        std::path::Path::new(&path).exists(),
-        "the returned path must exist on the service host: {path}"
-    );
+
+    // *Whose* filesystem is a property of the deployment, not of the promise. Against a
+    // service running here the path is checkable directly; the Docker service CI runs
+    // names a file inside the container, which no test on the runner can dereference
+    // (see `E2ECtx::external_service`). The media route is what verifies such a file
+    // across that boundary — so the local read is an extra check, never the only one.
+    let png_name = artifact_name(&path);
+    let http = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("reqwest client build failed");
+
+    if ctx.external_service {
+        eprintln!(
+            "[scrape_formats] external service: {path} names a file on the service host; \
+             the screenshot is verified through /api/scrape/media/{png_name} instead"
+        );
+    } else {
+        assert!(
+            std::path::Path::new(&path).exists(),
+            "the returned path must exist on the service host: {path}"
+        );
+    }
 
     // ── 4b. `pdf`: a second live format, printed and filed ────────────────
     let pdf_path = json_string_field(mixed_doc, "pdf")
@@ -4891,31 +4910,40 @@ pub(super) fn test_scrape_formats(ctx: &mut E2ECtx) {
         "base64 output must be opt-in:\n{}",
         &mixed_doc[..mixed_doc.len().min(600)]
     );
-    // The strongest available check: read the file back and look for the PDF magic. A
-    // path that exists but holds an error page or a stub would pass every field-level
-    // assertion while being useless to the caller.
-    let pdf_bytes = fs::read(&pdf_path)
-        .unwrap_or_else(|e| panic!("the returned pdf path must be readable ({pdf_path}): {e}"));
-    assert!(
-        pdf_bytes.starts_with(b"%PDF-"),
-        "expected a real PDF at {pdf_path}, got {} bytes starting with {:?}",
-        pdf_bytes.len(),
-        &pdf_bytes[..pdf_bytes.len().min(8)]
-    );
+    // The strongest check available where the file is readable: read it back and look
+    // for the PDF magic. A path that exists but holds an error page or a stub would pass
+    // every field-level assertion while being useless to the caller. When the service is
+    // on another host the bytes cannot be read here at all, and 4c reads them over HTTP
+    // instead — the same evidence, fetched the only way a remote caller can fetch it.
+    let local_pdf_bytes = match fs::read(&pdf_path) {
+        Ok(bytes) => {
+            assert!(
+                bytes.starts_with(b"%PDF-"),
+                "expected a real PDF at {pdf_path}, got {} bytes starting with {:?}",
+                bytes.len(),
+                &bytes[..bytes.len().min(8)]
+            );
+            Some(bytes)
+        }
+        Err(error) => {
+            assert!(
+                ctx.external_service,
+                "the returned pdf path must be readable ({pdf_path}): {error}"
+            );
+            eprintln!(
+                "[scrape_formats] external service: {pdf_path} is on the service host \
+                 ({error}); the media fetch below carries the bytes instead"
+            );
+            None
+        }
+    };
 
     // ── 4c. The artifact is fetchable by name over HTTP ───────────────────
     // The endpoint exists because the path above is on the *backend's* machine: a caller
     // anywhere else cannot dereference it. Only a name is accepted, never a path.
-    let name = std::path::Path::new(&pdf_path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or_else(|| panic!("no file name in {pdf_path}"));
-    let http = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .expect("reqwest client build failed");
+    let pdf_name = artifact_name(&pdf_path);
 
-    let url = format!("{}/api/scrape/media/{}", ctx.browser4_base_url, name);
+    let url = format!("{}/api/scrape/media/{pdf_name}", ctx.browser4_base_url);
     let response = http.get(&url).send().unwrap_or_else(|e| panic!("GET {url} failed: {e}"));
     assert_eq!(response.status().as_u16(), 200, "GET {url}");
     assert_eq!(
@@ -4927,9 +4955,44 @@ pub(super) fn test_scrape_formats(ctx: &mut E2ECtx) {
         "the media type must follow the artifact kind",
     );
     let fetched = response.bytes().expect("media response body").to_vec();
+    // Checked against the served bytes and not only against the local copy: this is the
+    // assertion that still means something when the service runs on another host.
+    assert!(
+        fetched.starts_with(b"%PDF-"),
+        "the served artifact must really be a PDF, got {} bytes starting with {:?}",
+        fetched.len(),
+        &fetched[..fetched.len().min(8)]
+    );
+    if let Some(local) = &local_pdf_bytes {
+        assert_eq!(
+            &fetched, local,
+            "the bytes fetched over HTTP must be the file the path pointed at"
+        );
+    }
+
+    // The screenshot's half of the same story: `path` may well be unreachable from this
+    // host (the Docker service in CI), and asking the service for the bytes is how its
+    // existence is established anyway — a 200 with PNG magic says the file is there and
+    // holds what the field claimed.
+    let png_url = format!("{}/api/scrape/media/{png_name}", ctx.browser4_base_url);
+    let png_response = http
+        .get(&png_url)
+        .send()
+        .unwrap_or_else(|e| panic!("GET {png_url} failed: {e}"));
+    assert_eq!(png_response.status().as_u16(), 200, "GET {png_url}");
     assert_eq!(
-        fetched, pdf_bytes,
-        "the bytes fetched over HTTP must be the file the path pointed at"
+        png_response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("image/png"),
+        "the media type must follow the artifact kind",
+    );
+    let png = png_response.bytes().expect("screenshot response body");
+    assert!(
+        png.starts_with(&[0x89, b'P', b'N', b'G']),
+        "the served screenshot must really be a PNG, got {} bytes",
+        png.len()
     );
 
     // A name that is really a path is never resolved. The exact status is the servlet
@@ -5082,4 +5145,16 @@ fn json_string_field(document: &str, key: &str) -> Option<String> {
     let rest = &document[start..];
     let end = rest.find('"')?;
     Some(rest[..end].replace("\\\\", "\\"))
+}
+
+/// The file name out of an artifact path a scrape returned.
+///
+/// `GET /api/scrape/media/{name}` accepts a **name** and never a path, which makes the
+/// file name the only part of a service-side path a caller on another host can use.
+fn artifact_name(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_else(|| panic!("no file name in {path}"))
+        .to_string()
 }
