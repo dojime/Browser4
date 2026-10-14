@@ -21,6 +21,10 @@ param(
     [string]$JarPath
 )
 
+# Emit UTF-8 through a redirected stream — see Set-Utf8ConsoleEncoding in
+# bin/common/Util.ps1 (under CP936 "·" becomes "??" and "═" becomes "?T").
+. (Join-Path $PSScriptRoot 'common/Util.ps1')
+
 if (-not (Test-Path $JarPath)) {
     Write-Error "File not found: $JarPath"
     exit 1

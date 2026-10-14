@@ -88,7 +88,7 @@ argument-escaping validation.
 |---|---|
 | `run-tests.ps1` | PowerShell test runner (discover, run, summarise, AI failure analysis) |
 | `run-tests.sh` | Bash wrapper that invokes `run-tests.ps1` with locale detection |
-| `test-utils.psm1` | Shared PowerShell test utilities module (self-contained) |
+| `test-utils.psm1` | Shared PowerShell test utilities module (self-contained). Importing it also pins the process to UTF-8 output: the suite's stdout is captured to files that are read back as UTF-8, and a redirected stream otherwise starts on the Windows OEM code page, where `·` / `—` become `??` and `═` becomes `?T` (CP936 `A8 54` — the `0x54` is a literal `T`). |
 | `seeds.txt` | Seed URLs for swarm tests |
 | `seeds-stress.txt` | Extended seed list for stress-swarm-agents |
 

@@ -439,7 +439,7 @@ const TIPS_GENERAL: &[Tip] = &[
         text: "Use `--server <url>` to target a remote Browser4 server for distributed scraping",
     },
     Tip {
-        text: "Use `list` to see all active sessions and their current page URLs at a glance",
+        text: "Use `list` to see all active sessions and their current page URLs at a glance — add `--all` to include the sessions persisted by other checkouts (Workspace column)",
     },
     Tip {
         text: "Use `doctor` to diagnose Chrome, Java, and network issues when things aren't working",

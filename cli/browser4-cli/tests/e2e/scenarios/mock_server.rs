@@ -881,6 +881,142 @@ pub(super) fn test_list_multiple_named_sessions(ctx: &mut E2ECtx) {
     );
 }
 
+/// `list` reports the current workspace only; `list --all` adds the sessions
+/// persisted by sibling workspaces (each checkout keeps its own state
+/// namespace), and `--verbose` lifts the URL column cap.
+pub(super) fn test_list_all_workspaces(ctx: &mut E2ECtx) {
+    reset_cli_artifacts(ctx);
+
+    let mock_server = MockBrowser4Server::start();
+    ctx.browser4_base_url = mock_server.base_url();
+
+    // The current namespace holds a default session whose URL is longer than
+    // the 48-character table cap, so `--verbose` is observable.
+    fs::write(
+        state_file_path(&ctx.state_dir, None),
+        serde_json::json!({
+            "sessionId": "swarm-session-current",
+            "baseUrl": mock_server.base_url(),
+        })
+        .to_string(),
+    )
+    .expect("write current state fixture");
+
+    let long_url = format!(
+        "https://mock.browser4.local/{}",
+        "long-path-segment/".repeat(4)
+    );
+    let mut current = MockListedSession::active("swarm-session-current");
+    current.url = long_url.clone();
+    mock_server.set_listed_sessions(vec![current]);
+
+    // A sibling workspace namespace, exactly where `--all` looks for it.
+    let sibling_state = ctx.state_dir.join("workspaces").join("other-checkout-7f3a");
+    let sibling_session = state_file_path(&sibling_state, Some("scrape"));
+    fs::create_dir_all(sibling_session.parent().unwrap()).expect("create sibling sessions dir");
+    fs::write(
+        &sibling_session,
+        serde_json::json!({
+            "sessionId": "foreign-session-1",
+            "baseUrl": "http://127.0.0.1:9",
+        })
+        .to_string(),
+    )
+    .expect("write sibling workspace state");
+
+    // ---- plain `list` stays scoped to the current workspace ----
+    let plain = run_command(ctx, &["list"]);
+    assert_eq!(plain.exit_code, 0, "expected list to succeed");
+    assert!(
+        plain.stdout.contains("swarm-session-current") && plain.stdout.contains("Active"),
+        "expected the current session to be Active:\n{}",
+        plain.stdout
+    );
+    assert!(
+        !plain.stdout.contains("Workspace") && !plain.stdout.contains("other-checkout-7f3a"),
+        "plain list must stay scoped to the current workspace:\n{}",
+        plain.stdout
+    );
+    assert!(
+        !plain.stdout.contains(&long_url),
+        "the URL column is capped unless --verbose is given:\n{}",
+        plain.stdout
+    );
+
+    // ---- `list --all` adds the sibling workspace ----
+    let all = run_command(ctx, &["list", "--all"]);
+    assert_eq!(all.exit_code, 0, "expected list --all to succeed");
+    let output = &all.stdout;
+    assert!(
+        output.contains("Workspace"),
+        "expected a Workspace column with --all:\n{output}"
+    );
+    assert!(
+        output.contains("other-checkout-7f3a") && output.contains("foreign-session-1"),
+        "expected the sibling workspace row:\n{output}"
+    );
+    // This backend cannot verify another workspace's session, so the row
+    // degrades to Unknown instead of claiming a status it cannot know.
+    assert!(
+        output.contains("Unknown"),
+        "expected Unknown for an unverifiable sibling row:\n{output}"
+    );
+    assert!(
+        output.contains("scanned"),
+        "expected the --all scan summary:\n{output}"
+    );
+    assert!(
+        output.contains("* = current workspace"),
+        "expected the current-workspace marker legend:\n{output}"
+    );
+    assert!(
+        !output.contains(&long_url),
+        "--all alone must not lift the URL cap:\n{output}"
+    );
+
+    // ---- `--all --verbose` lifts the cap ----
+    let verbose = run_command(ctx, &["list", "--all", "--verbose"]);
+    assert_eq!(
+        verbose.exit_code, 0,
+        "expected list --all --verbose to succeed"
+    );
+    assert!(
+        verbose.stdout.contains(&long_url),
+        "--verbose must print the untruncated URL:\n{}",
+        verbose.stdout
+    );
+
+    // ---- JSON: the workspace fields appear only with --all ----
+    let all_json = run_command(ctx, &["list", "--all", "--json"]);
+    let parsed = parse_json_output(&all_json.stdout, "list --all");
+    let sessions = parsed["output"]["sessions"]
+        .as_array()
+        .expect("sessions array in --all JSON");
+    let foreign = sessions
+        .iter()
+        .find(|session| session["session_id"] == "foreign-session-1")
+        .expect("sibling session in --all JSON");
+    assert_eq!(foreign["workspace"], "other-checkout-7f3a");
+    assert_eq!(foreign["workspace_current"], false);
+    let own = sessions
+        .iter()
+        .find(|session| session["session_id"] == "swarm-session-current")
+        .expect("current session in --all JSON");
+    assert_eq!(own["workspace_current"], true);
+
+    let plain_json = run_command(ctx, &["list", "--json"]);
+    let parsed = parse_json_output(&plain_json.stdout, "list");
+    let sessions = parsed["output"]["sessions"]
+        .as_array()
+        .expect("sessions array in list JSON");
+    assert!(
+        sessions
+            .iter()
+            .all(|session| session.get("workspace").is_none()),
+        "the default JSON shape must stay unchanged: {sessions:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // status
 // ---------------------------------------------------------------------------

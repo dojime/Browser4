@@ -236,7 +236,9 @@ document correctness, and SKILL documentation AI-friendliness. See also [mainten
 
 **Reporters** (`reporters/`): `report-console.ps1` (colorized terminal), `report-json.ps1`, `report-github-annotations.ps1`, `report-summary.ps1` (markdown).
 
-**Shared modules** (`common/`): `MaintenanceUtil.ps1` (logging, results, thresholds), `MaintenanceState.ps1` (persistent state I/O with file locking).
+**Shared modules** (`common/`): `MaintenanceUtil.ps1` (logging, results, thresholds), `MaintenanceState.ps1` (persistent state I/O with file locking), `Util.ps1` (encoding pin).
+
+**Console encoding**: dot-sourcing `common/Util.ps1` pins the process to UTF-8 (`Set-Utf8ConsoleEncoding`), because every consumer of these scripts reads UTF-8 — the relay in `bin/test.ps1`, the per-run logs, CI and the capture used for issue tracking. A redirected stream otherwise starts on the Windows OEM code page, where this tree's decoration degrades into line noise: `·` / `—` become `??` and `═` becomes `?T` (CP936 `A8 54`, whose `0x54` is a literal `T`). New entry points should dot-source `common/Util.ps1` — or the module that already does, such as `maintenance/common/MaintenanceUtil.ps1`. `bin/tests/console-encoding.tests.ps1` asserts the behavior end-to-end, from raw child bytes.
 
 **Configuration**: `thresholds/thresholds.psd1` (all numeric thresholds, overridable via env vars), `state/maintenance-state.json` (team-shared run history in git).
 

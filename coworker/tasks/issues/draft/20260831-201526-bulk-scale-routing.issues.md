@@ -63,11 +63,12 @@ MSYS2/Git Bash path conversion rewrites arguments starting with '/' (e.g. '/prod
 
 #### Human Review
 
-- [ ] **ACCEPT**
-- [ ] **ACCEPT with improvements**
-- [ ] **DEFER**
-- [ ] **WONTFIX**
-- [ ] **REJECT**
+- [ ] **ACCEPT** — issue confirmed valid; suggested improvement is correct
+- [ ] **ACCEPT with improvements** — issue valid but fix needs refinement (add details in Notes)
+- [ ] **DEFER** — issue acknowledged but intentionally deferred (add rationale in Notes)
+- [ ] **WONTFIX** — issue acknowledged but will not be fixed (add rationale in Notes)
+- [ ] **REJECT** — issue invalid, not a problem, or already addressed
+- [ ] **DUPLICATE** — issue duplicates another existing issue (reference in Notes)
 - **Notes:**
 
 ---
@@ -105,11 +106,12 @@ The runtime-bundle build script stages plugin JARs (build-runtime-bundle.ps1 lin
 
 #### Human Review
 
-- [ ] **ACCEPT**
-- [ ] **ACCEPT with improvements**
-- [ ] **DEFER**
-- [ ] **WONTFIX**
-- [ ] **REJECT**
+- [ ] **ACCEPT** — issue confirmed valid; suggested improvement is correct
+- [ ] **ACCEPT with improvements** — issue valid but fix needs refinement (add details in Notes)
+- [ ] **DEFER** — issue acknowledged but intentionally deferred (add rationale in Notes)
+- [ ] **WONTFIX** — issue acknowledged but will not be fixed (add rationale in Notes)
+- [ ] **REJECT** — issue invalid, not a problem, or already addressed
+- [ ] **DUPLICATE** — issue duplicates another existing issue (reference in Notes)
 - **Notes:**
 
 ---
@@ -147,11 +149,12 @@ Likely an off-by-one (or wave-index vs graph-depth mix-up) in the crawl result b
 
 #### Human Review
 
-- [ ] **ACCEPT**
-- [ ] **ACCEPT with improvements**
-- [ ] **DEFER**
-- [ ] **WONTFIX**
-- [ ] **REJECT**
+- [ ] **ACCEPT** — issue confirmed valid; suggested improvement is correct
+- [ ] **ACCEPT with improvements** — issue valid but fix needs refinement (add details in Notes)
+- [ ] **DEFER** — issue acknowledged but intentionally deferred (add rationale in Notes)
+- [ ] **WONTFIX** — issue acknowledged but will not be fixed (add rationale in Notes)
+- [ ] **REJECT** — issue invalid, not a problem, or already addressed
+- [ ] **DUPLICATE** — issue duplicates another existing issue (reference in Notes)
 - **Notes:**
 
 ---
@@ -188,11 +191,12 @@ The CLI's argument parser only recognizes short global flags before the command 
 
 #### Human Review
 
-- [ ] **ACCEPT**
-- [ ] **ACCEPT with improvements**
-- [ ] **DEFER**
-- [ ] **WONTFIX**
-- [ ] **REJECT**
+- [ ] **ACCEPT** — issue confirmed valid; suggested improvement is correct
+- [ ] **ACCEPT with improvements** — issue valid but fix needs refinement (add details in Notes)
+- [ ] **DEFER** — issue acknowledged but intentionally deferred (add rationale in Notes)
+- [ ] **WONTFIX** — issue acknowledged but will not be fixed (add rationale in Notes)
+- [ ] **REJECT** — issue invalid, not a problem, or already addressed
+- [ ] **DUPLICATE** — issue duplicates another existing issue (reference in Notes)
 - **Notes:**
 
 ---
@@ -230,11 +234,12 @@ The daemon rebuilds/refreshes the backend bundle from source on restart in dev m
 
 #### Human Review
 
-- [ ] **ACCEPT**
-- [ ] **ACCEPT with improvements**
-- [ ] **DEFER**
-- [ ] **WONTFIX**
-- [ ] **REJECT**
+- [ ] **ACCEPT** — issue confirmed valid; suggested improvement is correct
+- [ ] **ACCEPT with improvements** — issue valid but fix needs refinement (add details in Notes)
+- [ ] **DEFER** — issue acknowledged but intentionally deferred (add rationale in Notes)
+- [ ] **WONTFIX** — issue acknowledged but will not be fixed (add rationale in Notes)
+- [ ] **REJECT** — issue invalid, not a problem, or already addressed
+- [ ] **DUPLICATE** — issue duplicates another existing issue (reference in Notes)
 - **Notes:**
 
 ---
@@ -272,11 +277,12 @@ The CLI's poll loop prints only the cumulative pages-found count on every poll t
 
 #### Human Review
 
-- [ ] **ACCEPT**
-- [ ] **ACCEPT with improvements**
-- [ ] **DEFER**
-- [ ] **WONTFIX**
-- [ ] **REJECT**
+- [ ] **ACCEPT** — issue confirmed valid; suggested improvement is correct
+- [ ] **ACCEPT with improvements** — issue valid but fix needs refinement (add details in Notes)
+- [ ] **DEFER** — issue acknowledged but intentionally deferred (add rationale in Notes)
+- [ ] **WONTFIX** — issue acknowledged but will not be fixed (add rationale in Notes)
+- [ ] **REJECT** — issue invalid, not a problem, or already addressed
+- [ ] **DUPLICATE** — issue duplicates another existing issue (reference in Notes)
 - **Notes:**
 
 ---
@@ -313,11 +319,12 @@ The help renderer for subcommand groups shows only subcommand summaries, not eac
 
 #### Human Review
 
-- [ ] **ACCEPT**
-- [ ] **ACCEPT with improvements**
-- [ ] **DEFER**
-- [ ] **WONTFIX**
-- [ ] **REJECT**
+- [ ] **ACCEPT** — issue confirmed valid; suggested improvement is correct
+- [ ] **ACCEPT with improvements** — issue valid but fix needs refinement (add details in Notes)
+- [ ] **DEFER** — issue acknowledged but intentionally deferred (add rationale in Notes)
+- [ ] **WONTFIX** — issue acknowledged but will not be fixed (add rationale in Notes)
+- [ ] **REJECT** — issue invalid, not a problem, or already addressed
+- [ ] **DUPLICATE** — issue duplicates another existing issue (reference in Notes)
 - **Notes:**
 
 ---

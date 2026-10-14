@@ -1926,10 +1926,16 @@ pub fn generate_command_help(cmd: &CommandDef) -> String {
             "  - ",
             4,
         ));
+        lines.push(wrap_text(
+            "Use --all to add a Workspace column and include the sessions persisted by every other workspace on this machine — in development mode each checkout keeps its own state namespace. The workspace you are running in is marked with '*'. Sessions of other workspaces are read from their local state only: this backend cannot verify them, so their Status reads Unknown, URL is '-', and Next open is Refresh. With --json, each row carries workspace and workspace_current when --all is given.",
+            "  - ",
+            4,
+        ));
         lines.push(String::new());
         lines.push("Examples:".to_string());
         lines.push("  browser4-cli list".to_string());
         lines.push("  browser4-cli list --verbose".to_string());
+        lines.push("  browser4-cli list --all".to_string());
     }
 
     if cmd.name == "goto" {
@@ -4678,6 +4684,11 @@ mod tests {
         assert!(help.contains("status and next-open behavior"));
         assert!(help.contains("Active, Stale, or Unknown"));
         assert!(help.contains("Reuse the saved session or Refresh it"));
+        // `--all` promises cross-workspace rows, so the help must state how
+        // those unverifiable rows degrade and how they are marked.
+        assert!(help.contains("Workspace column"));
+        assert!(help.contains("workspace_current"));
+        assert!(help.contains("browser4-cli list --all"));
     }
 
     #[test]

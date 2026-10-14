@@ -33,6 +33,22 @@ if (Test-Path $agentUtilsPath) {
     $script:AgentUtilsAvailable = $true
 }
 
+# ── Console encoding: always UTF-8 ──────────────────────────────────────────
+# Every script in this suite imports this module before its first write, and the
+# suite's output is captured to files that are read back as UTF-8 (see
+# Invoke-PwshScriptWithTimeout in bin/test-production.ps1).  A redirected stream
+# otherwise starts on the Windows OEM code page: under CP936 the decoration
+# becomes "??" and "═" becomes "?T" (CP936 A8 54 — the 0x54 is a literal 'T').
+# Inline rather than dot-sourced from bin/common so the suite still works when
+# it is copied out of the repository.
+try {
+    if ([Console]::OutputEncoding.CodePage -ne 65001) {
+        [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+    }
+} catch {
+    # A host without a usable console must not fail the tests.
+}
+
 # ============================================================================
 # Module-level state (script-scoped so it won't leak between tests)
 # ============================================================================

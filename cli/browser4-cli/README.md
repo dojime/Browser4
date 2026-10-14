@@ -72,7 +72,7 @@ report the skew). See [CLI install & upgrade](../../docs/cli-install-upgrade.md#
 |---|---|
 | `open [url]` | Open a browser session or refresh the saved one if it is no longer active |
 | `close` | Close the browser |
-| `list` | List browser sessions with their status and next-open behavior |
+| `list` | List browser sessions with their status and next-open behavior. `--all` adds a Workspace column covering the sessions persisted by every other checkout; `--verbose` lifts the URL/Session-ID column caps |
 | `close-all` | Close all browser sessions without stopping the Browser4 backend |
 | `kill-all` | Forcefully stop the Browser4 backend and kill all browser processes |
 | `stop` | Gracefully stop the Browser4 server |
