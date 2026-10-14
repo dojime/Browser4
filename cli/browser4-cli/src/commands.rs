@@ -3130,12 +3130,25 @@ pub fn all_commands() -> Vec<CommandDef> {
             batch_supported: false,
             args: &[],
             options: &[
-                OptionDef { name: "all", description: "List all browser sessions across all workspaces", is_bool: true, short: None },
+                OptionDef { name: "all", description: "Also list the sessions persisted by every other workspace on this machine (adds a Workspace column)", is_bool: true, short: None },
                 OptionDef { name: "verbose", description: "Show full page URLs and session IDs without column width truncation", is_bool: true, short: None },
             ],
             e2e_coverage: E2eCoverage::Tested,
             tool_name_fn: |_| String::new(),
-            tool_params_fn: |_| json!({}),
+            // `list` is handled entirely CLI-side (no MCP tool call), so these
+            // parameters only carry the two flags into the handler — without
+            // them the dispatcher's `tool_params.get(...)` lookups always miss
+            // and both flags would silently do nothing.
+            tool_params_fn: |args| {
+                let mut params = json!({});
+                if let Some(true) = get_bool(args, "all") {
+                    params["all"] = json!(true);
+                }
+                if let Some(true) = get_bool(args, "verbose") {
+                    params["verbose"] = json!(true);
+                }
+                params
+            },
         },
         CommandDef {
             name: "profiles-list",
@@ -7209,6 +7222,32 @@ mod tests {
         assert!(cmd.options[0].is_bool);
         assert_eq!(cmd.options[1].name, "verbose");
         assert!(cmd.options[1].is_bool);
+    }
+
+    /// `list` is handled CLI-side, and the handler reads both flags from the
+    /// tool parameters — so the mapping is what makes `--all` / `--verbose`
+    /// anything other than silent no-ops.
+    #[test]
+    fn test_list_command_forwards_all_and_verbose_flags() {
+        let map = commands_map();
+        let cmd = map.get("list").expect("list command must exist");
+
+        let params = (cmd.tool_params_fn)(&HashMap::new());
+        assert!(params.get("all").is_none(), "an absent flag must stay absent");
+        assert!(params.get("verbose").is_none());
+
+        let mut args = HashMap::new();
+        args.insert("all".to_string(), json!(true));
+        args.insert("verbose".to_string(), json!(true));
+        let params = (cmd.tool_params_fn)(&args);
+        assert_eq!(params["all"], json!(true));
+        assert_eq!(params["verbose"], json!(true));
+
+        // An explicit false (e.g. --verbose=false) must not enable the flag.
+        let mut args = HashMap::new();
+        args.insert("all".to_string(), json!(false));
+        args.insert("verbose".to_string(), json!(false));
+        assert_eq!((cmd.tool_params_fn)(&args), json!({}));
     }
 
     // -----------------------------------------------------------------------

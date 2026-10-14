@@ -78,10 +78,10 @@ use snapshot::{
 };
 use state::{
     clear_all_state, clear_state, epoch_millis_to_display, format_async_task_list,
-    format_timestamp_display, read_async_tasks, read_state, resolve_default_state_dir, resolve_ref,
-    summarize_async_tasks, track_async_task, track_async_task_in_batch,
-    update_async_task_status, write_async_tasks,
-    write_state, CliState, MousePosition, Table,
+    format_timestamp_display, read_async_tasks, read_state, resolve_default_state_dir,
+    resolve_global_state_dir, resolve_ref, summarize_async_tasks, track_async_task,
+    track_async_task_in_batch, update_async_task_status, write_async_tasks, write_state, CliState,
+    MousePosition, Table, WORKSPACES_DIR_NAME,
 };
 
 const VERSION: &str = env!("BROWSER4_CLI_VERSION");
@@ -4967,28 +4967,137 @@ struct SessionRow {
     next_open: String,
 }
 
-async fn handle_list(client: &Client, base_url: &str, verbose: bool) -> Result<(), String> {
-    let (backend_sessions, backend_note): (Option<Vec<BackendSessionRecord>>, Option<String>) =
-        match call_tool(client, base_url, "list_sessions", json!({})).await {
-            Ok(result) => (Some(parse_backend_session_records(&result)), None),
-            Err(error) if is_backend_unreachable_error(&error) => (
-                None,
-                Some(format!(
-                    "Note: Browser4 backend is not started or unreachable at {}. Showing local persisted sessions only; the next `open` will refresh any saved session because its active state cannot be verified.",
-                    base_url
-                )),
-            ),
-            Err(error) => return Err(error),
-        };
+/// One CLI state namespace whose persisted sessions `list` reports.
+///
+/// Development mode gives every checkout its own namespace
+/// (`~/.browser4/workspaces/<checkout>-<hash>/`, see
+/// [`resolve_default_state_dir`]), so "every session" is a multi-directory
+/// question: [`collect_state_namespaces`] enumerates them and each row group
+/// keeps the namespace it came from.
+struct StateNamespace {
+    /// State directory — the parent of `sessions/` and `cli-state.json`.
+    dir: PathBuf,
+    /// Human-readable workspace label: the checkout slug, [`HOME_NAMESPACE_LABEL`]
+    /// for the shared layout, or the directory name for an explicit override.
+    label: String,
+    /// Whether this is the namespace the current invocation reads and writes —
+    /// the only one whose sessions the backend we talk to can verify.
+    is_current: bool,
+}
 
+/// Label of the shared (installed) state layout, i.e. the state root itself.
+const HOME_NAMESPACE_LABEL: &str = "(home)";
+
+/// Enumerate the state namespaces `list` reports, the current one first.
+///
+/// With `all`, the shared layout (the state root itself, where an installed CLI
+/// keeps `sessions/` and `cli-state.json`) and every directory under its
+/// `workspaces/` folder are appended, sorted by label so the output is stable
+/// across filesystems.  Directories are de-duplicated through [`dir_key`], so a
+/// symlinked or differently-cased spelling of one namespace is not listed
+/// twice.
+///
+/// `BROWSER4_CLI_STATE_DIR` replaces the state root, so in that setup the
+/// sibling namespaces are the root's own `workspaces/` children.
+fn collect_state_namespaces(current: &Path, global: &Path, all: bool) -> Vec<StateNamespace> {
+    let current_key = dir_key(current);
+    let global_key = dir_key(global);
+    let mut seen: Vec<PathBuf> = vec![current_key.clone()];
+    let mut namespaces = vec![StateNamespace {
+        dir: current.to_path_buf(),
+        label: namespace_label(current, &current_key, &global_key),
+        is_current: true,
+    }];
+    if !all {
+        return namespaces;
+    }
+
+    let mut candidates: Vec<(PathBuf, PathBuf)> = Vec::new();
+    if global_key != current_key {
+        candidates.push((global.to_path_buf(), global_key.clone()));
+    }
+    if let Ok(entries) = std::fs::read_dir(global.join(WORKSPACES_DIR_NAME)) {
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            let key = dir_key(&dir);
+            if key != current_key {
+                candidates.push((dir, key));
+            }
+        }
+    }
+
+    let mut labelled: Vec<(String, PathBuf)> = Vec::new();
+    for (dir, key) in candidates {
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key.clone());
+        labelled.push((namespace_label(&dir, &key, &global_key), dir));
+    }
+    labelled.sort();
+    for (label, dir) in labelled {
+        namespaces.push(StateNamespace {
+            dir,
+            label,
+            is_current: false,
+        });
+    }
+    namespaces
+}
+
+/// Identity of a state directory: its canonical path when it exists, the raw
+/// path otherwise (a namespace that does not exist yet holds no sessions
+/// anyway).  Calling this once per directory keeps the namespace scan from
+/// canonicalizing the same paths repeatedly on a machine with many checkouts.
+fn dir_key(dir: &Path) -> PathBuf {
+    std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
+}
+
+/// Workspace label of one state directory: `(home)` for the shared layout, the
+/// directory name (the checkout slug) otherwise.
+fn namespace_label(dir: &Path, key: &Path, global_key: &Path) -> String {
+    if key == global_key {
+        return HOME_NAMESPACE_LABEL.to_string();
+    }
+    dir.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| dir.display().to_string())
+}
+
+/// Workspace cell of the `--all` table: the label, with the namespace this
+/// invocation uses marked so the live rows are obvious among many workspaces.
+fn namespace_cell(namespace: &StateNamespace) -> String {
+    if namespace.is_current {
+        format!("{} *", namespace.label)
+    } else {
+        namespace.label.clone()
+    }
+}
+
+/// Collect the persisted sessions of one state namespace.
+///
+/// `backend_sessions` is the session list of the backend this invocation talks
+/// to: `Some` for the current namespace and `None` for every other workspace,
+/// whose sessions that backend can never verify.  `None` already means exactly
+/// that to the row helpers (Status `Unknown`, Next open `Refresh`, URL `-`), so
+/// foreign rows degrade honestly instead of claiming a status they cannot know.
+///
+/// Named sessions are sorted by name and the `(default)` session always comes
+/// last, so the table is stable across filesystems (`read_dir` order is not).
+fn collect_namespace_sessions(
+    state_dir: &Path,
+    backend_sessions: Option<&[BackendSessionRecord]>,
+) -> Vec<SessionRow> {
     let mut rows: Vec<SessionRow> = Vec::new();
-    let mut json_sessions: Vec<serde_json::Value> = Vec::new();
-    let backend_reachable = backend_sessions.is_some();
 
     // ---- collect named sessions ----
-    let state_dir = resolve_default_state_dir().join("sessions");
-    if state_dir.exists() {
-        if let Ok(entries) = std::fs::read_dir(state_dir) {
+    let sessions_dir = state_dir.join("sessions");
+    if sessions_dir.exists() {
+        if let Ok(entries) = std::fs::read_dir(sessions_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.extension().map_or(false, |ext| ext == "json") {
@@ -4996,19 +5105,16 @@ async fn handle_list(client: &Client, base_url: &str, verbose: bool) -> Result<(
                     if let Ok(content) = std::fs::read_to_string(&path) {
                         if let Ok(state) = serde_json::from_str::<CliState>(&content) {
                             if let Some(ref sid) = state.session_id {
-                                let status = list_session_status(backend_sessions.as_deref(), sid);
+                                let status = list_session_status(backend_sessions, sid);
                                 let next_open =
-                                    list_session_next_open_action(backend_sessions.as_deref(), sid);
-                                let backend_record = backend_sessions.as_ref().and_then(|records| {
+                                    list_session_next_open_action(backend_sessions, sid);
+                                let backend_record = backend_sessions.and_then(|records| {
                                     records.iter().find(|r| r.session_id == *sid)
                                 });
                                 let conn = connection_label_full(&state, backend_record);
                                 let display = session_display_label(&state, backend_record);
-                                let (created, last_access) = list_session_timestamps(
-                                    backend_sessions.as_deref(),
-                                    sid,
-                                    Some(&state),
-                                );
+                                let (created, last_access) =
+                                    list_session_timestamps(backend_sessions, sid, Some(&state));
                                 rows.push(SessionRow {
                                     name: name.to_string(),
                                     session_id: sid.clone(),
@@ -5030,23 +5136,22 @@ async fn handle_list(client: &Client, base_url: &str, verbose: bool) -> Result<(
             }
         }
     }
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
 
     // ---- collect default session ----
     // A locally-saved default session the backend no longer knows about is
     // shown as Stale/Refresh (same as an unknown NAMED session) rather than
     // hidden — otherwise `list` and `status` disagree and the row that
     // `close-all` counts is invisible.
-    let default_state = read_state(None, None);
+    let default_state = read_state(Some(state_dir), None);
     if let Some(ref sid) = default_state.session_id {
-        let backend_knows_session = backend_sessions
-            .as_ref()
-            .map_or(true, |records| records.iter().any(|r| r.session_id == *sid));
+        let backend_knows_session =
+            backend_sessions.map_or(true, |records| records.iter().any(|r| r.session_id == *sid));
         if backend_knows_session {
-            let status = list_session_status(backend_sessions.as_deref(), sid);
-            let next_open = list_session_next_open_action(backend_sessions.as_deref(), sid);
-            let backend_record = backend_sessions
-                .as_ref()
-                .and_then(|records| records.iter().find(|r| r.session_id == *sid));
+            let status = list_session_status(backend_sessions, sid);
+            let next_open = list_session_next_open_action(backend_sessions, sid);
+            let backend_record =
+                backend_sessions.and_then(|records| records.iter().find(|r| r.session_id == *sid));
             let conn = connection_label_full(&default_state, backend_record);
             let display = session_display_label(&default_state, backend_record);
             let url = backend_record
@@ -5054,7 +5159,7 @@ async fn handle_list(client: &Client, base_url: &str, verbose: bool) -> Result<(
                 .filter(|u| !u.is_empty())
                 .unwrap_or_else(|| "-".to_string());
             let (created, last_access) =
-                list_session_timestamps(backend_sessions.as_deref(), sid, Some(&default_state));
+                list_session_timestamps(backend_sessions, sid, Some(&default_state));
             rows.push(SessionRow {
                 name: "(default)".to_string(),
                 session_id: sid.clone(),
@@ -5069,38 +5174,119 @@ async fn handle_list(client: &Client, base_url: &str, verbose: bool) -> Result<(
         }
     }
 
+    rows
+}
+
+async fn handle_list(
+    client: &Client,
+    base_url: &str,
+    verbose: bool,
+    all: bool,
+) -> Result<(), String> {
+    let (backend_sessions, backend_note): (Option<Vec<BackendSessionRecord>>, Option<String>) =
+        match call_tool(client, base_url, "list_sessions", json!({})).await {
+            Ok(result) => (Some(parse_backend_session_records(&result)), None),
+            Err(error) if is_backend_unreachable_error(&error) => (
+                None,
+                Some(format!(
+                    "Note: Browser4 backend is not started or unreachable at {}. Showing local persisted sessions only; the next `open` will refresh any saved session because its active state cannot be verified.",
+                    base_url
+                )),
+            ),
+            Err(error) => return Err(error),
+        };
+
+    let mut json_sessions: Vec<serde_json::Value> = Vec::new();
+    let backend_reachable = backend_sessions.is_some();
+
+    // ---- collect persisted sessions namespace by namespace ----
+    // Only the current namespace's sessions can be checked against the backend
+    // we talk to: every other workspace runs its own backend on its own port,
+    // so its rows are read from local state alone.
+    let current_dir = resolve_default_state_dir();
+    let global_dir = resolve_global_state_dir();
+    let namespaces = collect_state_namespaces(&current_dir, &global_dir, all);
+    let scanned_namespaces = namespaces.len();
+    let mut grouped: Vec<(StateNamespace, Vec<SessionRow>)> = Vec::new();
+    for namespace in namespaces {
+        let records = if namespace.is_current {
+            backend_sessions.as_deref()
+        } else {
+            None
+        };
+        let rows = collect_namespace_sessions(&namespace.dir, records);
+        if rows.is_empty() {
+            // Namespaces without persisted sessions are dropped so `--all`
+            // does not drown the table in empty workspaces.
+            continue;
+        }
+        grouped.push((namespace, rows));
+    }
+    let namespaces_with_sessions = grouped.len();
+
     // ---- render table ----
-    let table_rows: Vec<Vec<String>> = rows.iter().map(|r| {
-        vec![
-            r.name.clone(), r.session_id.clone(), r.url.clone(), r.status.clone(),
-            r.display.clone(),
-            r.created.clone(), r.last_access.clone(), r.connection.clone(),
-            r.next_open.clone(),
-        ]
-    }).collect();
+    let table_rows: Vec<Vec<String>> = grouped
+        .iter()
+        .flat_map(|(namespace, rows)| {
+            rows.iter().map(move |r| {
+                let mut cells = vec![
+                    r.name.clone(), r.session_id.clone(), r.url.clone(), r.status.clone(),
+                    r.display.clone(),
+                    r.created.clone(), r.last_access.clone(), r.connection.clone(),
+                    r.next_open.clone(),
+                ];
+                if all {
+                    // Workspace first: with --all the rows of one workspace read
+                    // as a block, which is the grouping users scan for.
+                    cells.insert(0, namespace_cell(namespace));
+                }
+                cells
+            })
+        })
+        .collect();
 
     let session_id_max_width: usize = if verbose { 0 } else { 40 };
     // Page URLs can be very long; cap them in the plain table so other
     // columns stay readable. --verbose removes the cap.
     let url_max_width: usize = if verbose { 0 } else { 48 };
-    let table = Table::new(&[
-        "Name", "Session ID", "URL", "Status", "Display", "Created", "Last Access", "Connection", "Next open",
-    ])
-    .min_widths(&[4, 10, 12, 8, 10, 19, 19, 10, 9])
-    .max_widths(&[30, session_id_max_width, url_max_width, 8, 10, 19, 19, 50, 0])
-    .truncate(true)
-    .add_rows(&table_rows);
+    let mut headers: Vec<&str> = vec![
+        "Name", "Session ID", "URL", "Status", "Display", "Created", "Last Access", "Connection",
+        "Next open",
+    ];
+    let mut min_widths: Vec<usize> = vec![4, 10, 12, 8, 10, 19, 19, 10, 9];
+    let mut max_widths: Vec<usize> = vec![
+        30, session_id_max_width, url_max_width, 8, 10, 19, 19, 50, 0,
+    ];
+    if all {
+        headers.insert(0, "Workspace");
+        min_widths.insert(0, 9);
+        max_widths.insert(0, 30);
+    }
+    let table = Table::new(&headers)
+        .min_widths(&min_widths)
+        .max_widths(&max_widths)
+        .truncate(true)
+        .add_rows(&table_rows);
 
     cli_println!("{}", table.render().trim_end());
 
     // Show empty-state message when no sessions are active
-    if rows.is_empty() {
-        cli_println!("\nNo active browser sessions.");
+    if table_rows.is_empty() {
+        cli_println!(
+            "\n{}",
+            if all {
+                "No active browser sessions in any workspace."
+            } else {
+                "No active browser sessions."
+            }
+        );
     }
 
     // Explain the (default) session if present — new users often wonder
     // where it came from.
-    let has_default = rows.iter().any(|r| r.name == "(default)");
+    let has_default = grouped
+        .iter()
+        .any(|(_, rows)| rows.iter().any(|r| r.name == "(default)"));
     if has_default {
         cli_println!(
             "\n(default) = unnamed session auto-created by goto/open without -s <name>. \
@@ -5108,18 +5294,48 @@ async fn handle_list(client: &Client, base_url: &str, verbose: bool) -> Result<(
         );
     }
 
-    for row in &rows {
-        json_sessions.push(json!({
-            "name": row.name,
-            "session_id": row.session_id,
-            "url": row.url,
-            "status": row.status.to_lowercase(),
-            "display_mode": row.display.to_lowercase(),
-            "created_at": row.created,
-            "last_accessed_at": row.last_access,
-            "connection": row.connection,
-            "next_open": row.next_open.to_lowercase(),
-        }));
+    if all {
+        cli_println!(
+            "\n--all: {} state namespace(s) scanned, {} holding persisted sessions.",
+            scanned_namespaces,
+            namespaces_with_sessions
+        );
+        // The caveat is about the rows actually shown: it must also appear when
+        // the current workspace is empty and only foreign rows are rendered.
+        if grouped
+            .iter()
+            .any(|(namespace, _)| !namespace.is_current)
+        {
+            cli_println!(
+                "  Sessions of other workspaces come from their locally persisted state: this \
+                 backend cannot verify them, so Status reads Unknown, URL is '-' and Next open \
+                 is Refresh."
+            );
+        }
+        if grouped.iter().any(|(namespace, _)| namespace.is_current) {
+            cli_println!("  * = current workspace ({}).", base_url);
+        }
+    }
+
+    for (namespace, rows) in &grouped {
+        for row in rows {
+            let mut entry = json!({
+                "name": row.name,
+                "session_id": row.session_id,
+                "url": row.url,
+                "status": row.status.to_lowercase(),
+                "display_mode": row.display.to_lowercase(),
+                "created_at": row.created,
+                "last_accessed_at": row.last_access,
+                "connection": row.connection,
+                "next_open": row.next_open.to_lowercase(),
+            });
+            if all {
+                entry["workspace"] = json!(namespace.label);
+                entry["workspace_current"] = json!(namespace.is_current);
+            }
+            json_sessions.push(entry);
+        }
     }
 
     json_field("sessions", json!(json_sessions));
@@ -27227,7 +27443,11 @@ async fn run(
                 .get("verbose")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            handle_list(&client, &base_url, verbose).await?;
+            let all = tool_params
+                .get("all")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            handle_list(&client, &base_url, verbose, all).await?;
         }
         "config" | "config-list" => {
             handle_config_list()?;
@@ -33652,6 +33872,144 @@ mod tests {
     fn list_session_status_empty_backend() {
         // Backend returned no sessions → Stale
         assert_eq!(list_session_status(Some(&[]), "s1"), "Stale");
+    }
+
+    // -----------------------------------------------------------------------
+    // list: state namespaces (--all)
+    // -----------------------------------------------------------------------
+
+    fn write_session_state_file(path: &Path, session_id: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            path,
+            json!({ "sessionId": session_id, "baseUrl": "http://127.0.0.1:1" }).to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn collect_state_namespaces_without_all_lists_only_the_current_workspace() {
+        let temp = test_temp_dir();
+        let global = temp.path().to_path_buf();
+        let current = global.join(WORKSPACES_DIR_NAME).join("checkout-a");
+        std::fs::create_dir_all(&current).unwrap();
+
+        let namespaces = collect_state_namespaces(&current, &global, false);
+
+        assert_eq!(namespaces.len(), 1);
+        assert_eq!(namespaces[0].dir, current);
+        assert_eq!(namespaces[0].label, "checkout-a");
+        assert!(namespaces[0].is_current);
+    }
+
+    #[test]
+    fn collect_state_namespaces_with_all_appends_the_home_layout_and_siblings() {
+        let temp = test_temp_dir();
+        let global = temp.path().to_path_buf();
+        let current = global.join(WORKSPACES_DIR_NAME).join("checkout-a");
+        std::fs::create_dir_all(&current).unwrap();
+        std::fs::create_dir_all(global.join(WORKSPACES_DIR_NAME).join("checkout-b")).unwrap();
+        // The shared (installed) layout keeps its sessions in the root itself.
+        std::fs::create_dir_all(global.join("sessions")).unwrap();
+        // A file where a namespace directory is expected must be ignored.
+        std::fs::write(global.join(WORKSPACES_DIR_NAME).join("stray.txt"), b"x").unwrap();
+
+        let namespaces = collect_state_namespaces(&current, &global, true);
+        let labels: Vec<&str> = namespaces.iter().map(|ns| ns.label.as_str()).collect();
+
+        // Current first, then the rest by label.
+        assert_eq!(
+            labels,
+            vec!["checkout-a", HOME_NAMESPACE_LABEL, "checkout-b"]
+        );
+        assert!(namespaces[0].is_current);
+        assert!(namespaces[1..].iter().all(|ns| !ns.is_current));
+        assert_eq!(namespaces[1].dir, global);
+    }
+
+    #[test]
+    fn collect_state_namespaces_keeps_an_override_root_single_entry() {
+        // BROWSER4_CLI_STATE_DIR replaces the state root, so the current
+        // namespace IS the shared layout — it must not be listed twice.
+        let temp = test_temp_dir();
+        let root = temp.path().join("state");
+        std::fs::create_dir_all(root.join(WORKSPACES_DIR_NAME).join("other")).unwrap();
+
+        let namespaces = collect_state_namespaces(&root, &root, true);
+        let labels: Vec<&str> = namespaces.iter().map(|ns| ns.label.as_str()).collect();
+
+        assert_eq!(labels, vec![HOME_NAMESPACE_LABEL, "other"]);
+    }
+
+    #[test]
+    fn namespace_cell_marks_the_current_workspace() {
+        let current = StateNamespace {
+            dir: PathBuf::from("/tmp/checkout-a"),
+            label: "checkout-a".to_string(),
+            is_current: true,
+        };
+        assert_eq!(namespace_cell(&current), "checkout-a *");
+
+        let other = StateNamespace {
+            is_current: false,
+            ..current
+        };
+        assert_eq!(namespace_cell(&other), "checkout-a");
+    }
+
+    #[test]
+    fn collect_namespace_sessions_sorts_by_name_and_keeps_default_last() {
+        let temp = test_temp_dir();
+        let state_dir = temp.path();
+        write_session_state_file(&state_dir.join("sessions").join("zulu.json"), "s-zulu");
+        write_session_state_file(&state_dir.join("sessions").join("alpha.json"), "s-alpha");
+        write_session_state_file(&state_dir.join("cli-state.json"), "s-default");
+
+        let rows = collect_namespace_sessions(state_dir, None);
+        let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+
+        assert_eq!(names, vec!["alpha", "zulu", "(default)"]);
+        // Without backend records every row degrades honestly.
+        assert!(rows.iter().all(|r| r.status == "Unknown"));
+        assert!(rows.iter().all(|r| r.next_open == "Refresh"));
+        assert!(rows.iter().all(|r| r.url == "-"));
+    }
+
+    #[test]
+    fn collect_namespace_sessions_hides_an_unknown_default_session_from_a_reachable_backend() {
+        let temp = test_temp_dir();
+        let state_dir = temp.path();
+        write_session_state_file(&state_dir.join("cli-state.json"), "s-default");
+
+        // The backend we talk to does not know this session → hidden, exactly
+        // like `status` reports it (a foreign namespace passes `None` instead,
+        // which shows the row as Unknown).
+        let records = vec![BackendSessionRecord {
+            session_id: "someone-else".to_string(),
+            ..Default::default()
+        }];
+        assert!(collect_namespace_sessions(state_dir, Some(&records)).is_empty());
+
+        let records = vec![BackendSessionRecord {
+            session_id: "s-default".to_string(),
+            status: Some("stopped".to_string()),
+            ..Default::default()
+        }];
+        let rows = collect_namespace_sessions(state_dir, Some(&records));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "(default)");
+        assert_eq!(rows[0].status, "Stale");
+    }
+
+    #[test]
+    fn collect_namespace_sessions_skips_unparsable_state_files() {
+        let temp = test_temp_dir();
+        let state_dir = temp.path();
+        std::fs::create_dir_all(state_dir.join("sessions")).unwrap();
+        std::fs::write(state_dir.join("sessions").join("empty.json"), "{}").unwrap();
+        std::fs::write(state_dir.join("sessions").join("broken.json"), "not json").unwrap();
+
+        assert!(collect_namespace_sessions(state_dir, None).is_empty());
     }
 
     // -----------------------------------------------------------------------

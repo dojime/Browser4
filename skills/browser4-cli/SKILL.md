@@ -150,6 +150,8 @@ Named sessions isolate browser state (cookies, localStorage, tabs) in a **dedica
 
 The `list` command also has a **Display** column with the mode fixed at session creation — Headed / Headless / Supervised / Attached (`-` when unrecorded).
 
+`list --all` adds a **Workspace** column and includes the sessions persisted by every other checkout on the machine — in development mode each checkout keeps its own state namespace under `~/.browser4/workspaces/`, so a session started in a sibling checkout is invisible to a plain `list`. The workspace you are running in is marked `*`. Those foreign rows come from local state only: this backend cannot verify another workspace's sessions, so they read **Status Unknown · URL `-` · Next open Refresh** — never treat them as dead, and close them from their own checkout. `--json` adds `workspace` + `workspace_current` to each row when `--all` is given.
+
 Two on-disk locations — don't confuse them:
 
 - **Session state** lives in `~/.browser4` by default (per checkout in development mode — see **Development Mode** below), falling back to `./.browser4-cli-state` when unwritable; override with `BROWSER4_CLI_STATE_DIR` / `BROWSER4_RUNTIME_DIR`.

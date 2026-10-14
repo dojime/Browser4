@@ -40,6 +40,7 @@ browser4-cli -s research goto "https://en.wikipedia.org"   # opens "research"
 browser4-cli -s news     goto "https://news.ycombinator.com" # opens "news"
 browser4-cli -s news     snapshot -i --stdout              # act inside "news"
 browser4-cli list                                          # show all sessions
+browser4-cli list --all                                    # + sessions from other checkouts (Workspace column)
 browser4-cli -s news     close                             # close only "news"
 browser4-cli close-all                                     # close every session
 ```
