@@ -409,14 +409,16 @@ open class RobustBrowserAgent(
         resetInnerToolExecutions()
         onWillRun(action)
 
-        // The first context created below starts this run's execution session; all
-        // contexts (and their agent states) of this run share that session id.
-        val contextCountBefore = stateManager.contexts.size
+        // Track the session id directly from the resolve result instead of
+        // indexing into the shared contexts list (which may be trimmed in the
+        // future, and could leak the previous run's session id on early failure).
+        var runSessionId: String? = null
 
         try {
             val ctx = agentScope.coroutineContext.minusKey(Job)
 
             val result = withContext(ctx) { resolveProblemInCoroutine(action) }
+            runSessionId = result.context.sessionId
 
             onDidRun(action, result.result)
 
@@ -431,7 +433,7 @@ open class RobustBrowserAgent(
             throw e
         } finally {
             stateManager.writeAllProcessTrace()
-            _lastRunSessionId = stateManager.contexts.getOrNull(contextCountBefore)?.sessionId
+            _lastRunSessionId = runSessionId
         }
 
         return stateHistory.snapshotFor(_lastRunSessionId)
@@ -601,8 +603,10 @@ open class RobustBrowserAgent(
         )
 
         // Overall timeout to prevent indefinite hangs for a full resolve session
-        // Calculate effective timeout accounting for potential retry delays
-        val maxPossibleDelays = (0 until config.maxRetries).fold(0L) { acc, i -> acc + calculateRetryDelay(i) }
+        // Use the deterministic worst-case delay budget: maxRetries * maxDelayMs.
+        // (calculateRetryDelay has random jitter, which would make the timeout
+        // budget non-deterministic across runs.)
+        val maxPossibleDelays = config.maxRetries * config.maxRetryDelayMs
         val effectiveTimeout = config.resolveTimeoutMs + maxPossibleDelays
 
         return try {
@@ -625,7 +629,14 @@ open class RobustBrowserAgent(
                     "instruction" to Strings.compactInline(instruction, COMPACT_INLINE_SESSION_LENGTH)
                 ), message = "⏳ resolve TIMEOUT"
             )
-            val actResult = ActResultHelper.failed(e, action = instruction)
+            // Wrap in a non-cancellation error: a resolve timeout is NOT a user
+            // cancellation. run() rethrows the ActResult exception, and a raw
+            // TimeoutCancellationException would route through the cancellation
+            // channel and be misreported as "cancelled" by callers.
+            val timeoutError = PerceptiveAgentError.TimeoutError(
+                "⏳ Resolve timeout after $effectiveTimeout ms", e
+            )
+            val actResult = ActResultHelper.failed(timeoutError, action = instruction)
             ResolveResult(baseContext, actResult)
         } finally {
             // clear history so the next task will have a clean operation trace for summary.
@@ -655,12 +666,28 @@ open class RobustBrowserAgent(
                 // wait for the user to raise the limit before re-launching.
                 logger.error("🛑 resolve.request-token-limit.sid={} msg={}", sid, e.message)
                 return ResolveResult(activeContext, ActResultHelper.failed(e, action = action.action))
+            } catch (e: CancellationException) {
+                // Cancellation (including the overall resolve timeout) must
+                // propagate — retrying a cancelled coroutine defeats structured
+                // concurrency and masks the real stop reason.
+                throw e
             } catch (e: Exception) {
                 lastError = e
                 logger.error("💥 resolve.unexpected attempt={} sid={} msg={}", attempt + 1, sid, e.message, e)
 
                 cleanupPartialState(activeContext)
-                stateManager.buildBaseExecutionContext(action, "resolve-init-recovery")
+
+                // Permanent errors (validation/illegal-state) gain nothing from
+                // a retry — fail fast instead of burning more LLM tokens.
+                if (!retryStrategy.shouldRetry(e)) {
+                    logger.error("🛑 resolve.permanent sid={} msg={}", sid, e.message)
+                    break
+                }
+                // Back off before the next attempt; without this the retry loop
+                // hammers an already-failing model/browser with zero delay.
+                if (attempt < config.maxRetries) {
+                    delay(calculateRetryDelay(attempt).milliseconds)
+                }
             }
         }
 
@@ -758,15 +785,16 @@ open class RobustBrowserAgent(
 
             return ResolveResult(context, actResult)
         } catch (e: CancellationException) {
+            // User cancellation or the overall resolve timeout — propagate so
+            // the resolve layer can record 'resolveTimeout' and report a
+            // timeout instead of a user cancellation.
             logger.info(
                 "🛑 doResolve.cancelled sid={} steps={} reason={}",
                 context.sid,
                 context.step,
                 e.message ?: "user interruption"
             )
-
-            val result = ActResultHelper.failed(e, initContext.instruction)
-            return ResolveResult(context, result)
+            throw e
         } catch (e: Exception) {
             throw handleResolutionFailure(e, context, startTime)
         }
@@ -932,11 +960,11 @@ open class RobustBrowserAgent(
             agentMemory.consolidator?.schedule(context.sid)
             val actResult = buildFinalActResult(initContext.instruction, context, startTime, stopReason)
             return ResolveResult(context, actResult)
-        } catch (e: TimeoutCancellationException) {
+        } catch (e: LlmInferenceTimeoutException) {
             // P1-1: a single LLM call exceeded the per-call inference timeout.
-            // This is NOT a user cancellation — surface it as a distinct
-            // failure reason so the task status says "inference timed out"
-            // instead of "cancelled" (the two have very different retry cues).
+            // AgentToolCallLoop distinguishes this from outer cancellation via
+            // the dedicated exception type, so this branch only fires for a
+            // genuine hung/slow provider call.
             logger.warn("⛔ cli-agent.inference-timeout sid={} after {} ms: {}",
                 context.sid, config.llmInferenceTimeoutMs, e.message)
             agentMemory.sink.failed(
@@ -944,16 +972,16 @@ open class RobustBrowserAgent(
                 "LLM inference timed out after ${config.llmInferenceTimeoutMs}ms", step = context.step,
             )
             agentMemory.consolidator?.schedule(context.sid)
-            val timeoutError = IllegalStateException(
-                "LLM inference timed out after ${config.llmInferenceTimeoutMs} ms", e,
-            )
-            return ResolveResult(context, ActResultHelper.failed(timeoutError, initContext.instruction))
+            return ResolveResult(context, ActResultHelper.failed(e, initContext.instruction))
         } catch (e: CancellationException) {
+            // User cancellation or the overall resolve timeout — propagate so
+            // the resolve layer can record 'resolveTimeout' and report a
+            // timeout instead of a user cancellation.
             logger.info(
                 "🛑 cli-agent.cancelled sid={} reason={}",
                 context.sid, e.message ?: "user interruption"
             )
-            return ResolveResult(context, ActResultHelper.failed(e, initContext.instruction))
+            throw e
         } catch (e: Exception) {
             // Failure memory event (user cancellation is deliberately excluded).
             agentMemory.sink.failed(context.sid, uuid.toString(), e.message ?: e.javaClass.simpleName)
