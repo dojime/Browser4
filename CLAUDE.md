@@ -76,7 +76,7 @@ mvn test -pl browser4-rest -am -Dtest=MCPToolControllerTest
 
 Invoke the CLI from the repo root:
 - **PowerShell:** `./b4w.ps1 <command>` — auto-builds from source when needed
-- **Bash / Git Bash:** `./b4w.sh <command>` — wrapper that quotes args safely for pwsh
+- **Bash / Git Bash:** `./b4w.sh <command>` — forwards each argument via `pwsh -File`; disables MSYS path conversion
 - **Direct:** `browser4-cli <command>` — if installed globally
 
 > **Anti-pattern:** `$(./b4w.ps1) <command>` is **command substitution** in bash

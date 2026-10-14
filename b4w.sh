@@ -12,7 +12,7 @@
 # Usage: ./b4w.sh [args...]          (same as ./b4w.ps1 [args...])
 #
 # Shell selection guide:
-#   b4w.sh   — Git Bash / Linux / macOS (auto-quotes args for pwsh safety)
+#   b4w.sh   — Git Bash / Linux / macOS (forwards argv directly via pwsh -File)
 #   b4w.ps1  — PowerShell (direct, now uses manual arg parsing to avoid
 #              -o/-i/-v interception; preferred on Windows where pwsh is the
 #              primary shell)
