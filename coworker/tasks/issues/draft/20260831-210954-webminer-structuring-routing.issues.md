@@ -66,11 +66,12 @@ Unconfirmed. The crash is a genuine Rust stack overflow in the CLI binary (debug
 
 #### Human Review
 
-- [ ] **ACCEPT**
-- [ ] **ACCEPT with improvements**
-- [ ] **DEFER**
-- [ ] **WONTFIX**
-- [ ] **REJECT**
+- [ ] **ACCEPT** — issue confirmed valid; suggested improvement is correct
+- [ ] **ACCEPT with improvements** — issue valid but fix needs refinement (add details in Notes)
+- [ ] **DEFER** — issue acknowledged but intentionally deferred (add rationale in Notes)
+- [ ] **WONTFIX** — issue acknowledged but will not be fixed (add rationale in Notes)
+- [ ] **REJECT** — issue invalid, not a problem, or already addressed
+- [ ] **DUPLICATE** — issue duplicates another existing issue (reference in Notes)
 - **Notes:**
 
 ---
@@ -108,11 +109,12 @@ The abort code 0xc00000fd from the child is lost across the pwsh cargo-run / Inv
 
 #### Human Review
 
-- [ ] **ACCEPT**
-- [ ] **ACCEPT with improvements**
-- [ ] **DEFER**
-- [ ] **WONTFIX**
-- [ ] **REJECT**
+- [ ] **ACCEPT** — issue confirmed valid; suggested improvement is correct
+- [ ] **ACCEPT with improvements** — issue valid but fix needs refinement (add details in Notes)
+- [ ] **DEFER** — issue acknowledged but intentionally deferred (add rationale in Notes)
+- [ ] **WONTFIX** — issue acknowledged but will not be fixed (add rationale in Notes)
+- [ ] **REJECT** — issue invalid, not a problem, or already addressed
+- [ ] **DUPLICATE** — issue duplicates another existing issue (reference in Notes)
 - **Notes:**
 
 ---
@@ -150,11 +152,12 @@ The decision tree compresses the pipeline and omits the cache→disk export step
 
 #### Human Review
 
-- [ ] **ACCEPT**
-- [ ] **ACCEPT with improvements**
-- [ ] **DEFER**
-- [ ] **WONTFIX**
-- [ ] **REJECT**
+- [ ] **ACCEPT** — issue confirmed valid; suggested improvement is correct
+- [ ] **ACCEPT with improvements** — issue valid but fix needs refinement (add details in Notes)
+- [ ] **DEFER** — issue acknowledged but intentionally deferred (add rationale in Notes)
+- [ ] **WONTFIX** — issue acknowledged but will not be fixed (add rationale in Notes)
+- [ ] **REJECT** — issue invalid, not a problem, or already addressed
+- [ ] **DUPLICATE** — issue duplicates another existing issue (reference in Notes)
 - **Notes:**
 
 ---
@@ -191,11 +194,12 @@ The browser4-web-miner skill directory is not part of this repository/checkout w
 
 #### Human Review
 
-- [ ] **ACCEPT**
-- [ ] **ACCEPT with improvements**
-- [ ] **DEFER**
-- [ ] **WONTFIX**
-- [ ] **REJECT**
+- [ ] **ACCEPT** — issue confirmed valid; suggested improvement is correct
+- [ ] **ACCEPT with improvements** — issue valid but fix needs refinement (add details in Notes)
+- [ ] **DEFER** — issue acknowledged but intentionally deferred (add rationale in Notes)
+- [ ] **WONTFIX** — issue acknowledged but will not be fixed (add rationale in Notes)
+- [ ] **REJECT** — issue invalid, not a problem, or already addressed
+- [ ] **DUPLICATE** — issue duplicates another existing issue (reference in Notes)
 - **Notes:**
 
 ---
@@ -233,11 +237,12 @@ webminer's JAR writes CSV/views into the task-output root (%TEMP%/<app>-pereg/ml
 
 #### Human Review
 
-- [ ] **ACCEPT**
-- [ ] **ACCEPT with improvements**
-- [ ] **DEFER**
-- [ ] **WONTFIX**
-- [ ] **REJECT**
+- [ ] **ACCEPT** — issue confirmed valid; suggested improvement is correct
+- [ ] **ACCEPT with improvements** — issue valid but fix needs refinement (add details in Notes)
+- [ ] **DEFER** — issue acknowledged but intentionally deferred (add rationale in Notes)
+- [ ] **WONTFIX** — issue acknowledged but will not be fixed (add rationale in Notes)
+- [ ] **REJECT** — issue invalid, not a problem, or already addressed
+- [ ] **DUPLICATE** — issue duplicates another existing issue (reference in Notes)
 - **Notes:**
 
 ---
@@ -274,11 +279,12 @@ MODULE_OPENS in webminer.rs includes '--add-opens=java.base/sun.security.action=
 
 #### Human Review
 
-- [ ] **ACCEPT**
-- [ ] **ACCEPT with improvements**
-- [ ] **DEFER**
-- [ ] **WONTFIX**
-- [ ] **REJECT**
+- [ ] **ACCEPT** — issue confirmed valid; suggested improvement is correct
+- [ ] **ACCEPT with improvements** — issue valid but fix needs refinement (add details in Notes)
+- [ ] **DEFER** — issue acknowledged but intentionally deferred (add rationale in Notes)
+- [ ] **WONTFIX** — issue acknowledged but will not be fixed (add rationale in Notes)
+- [ ] **REJECT** — issue invalid, not a problem, or already addressed
+- [ ] **DUPLICATE** — issue duplicates another existing issue (reference in Notes)
 - **Notes:**
 
 ---
@@ -315,11 +321,12 @@ webdb export (or its normalization step) triggers a goto/session interaction who
 
 #### Human Review
 
-- [ ] **ACCEPT**
-- [ ] **ACCEPT with improvements**
-- [ ] **DEFER**
-- [ ] **WONTFIX**
-- [ ] **REJECT**
+- [ ] **ACCEPT** — issue confirmed valid; suggested improvement is correct
+- [ ] **ACCEPT with improvements** — issue valid but fix needs refinement (add details in Notes)
+- [ ] **DEFER** — issue acknowledged but intentionally deferred (add rationale in Notes)
+- [ ] **WONTFIX** — issue acknowledged but will not be fixed (add rationale in Notes)
+- [ ] **REJECT** — issue invalid, not a problem, or already addressed
+- [ ] **DUPLICATE** — issue duplicates another existing issue (reference in Notes)
 - **Notes:**
 
 ---
@@ -356,11 +363,12 @@ Likely the built-in polite-scraping rate limiting between page loads (documented
 
 #### Human Review
 
-- [ ] **ACCEPT**
-- [ ] **ACCEPT with improvements**
-- [ ] **DEFER**
-- [ ] **WONTFIX**
-- [ ] **REJECT**
+- [ ] **ACCEPT** — issue confirmed valid; suggested improvement is correct
+- [ ] **ACCEPT with improvements** — issue valid but fix needs refinement (add details in Notes)
+- [ ] **DEFER** — issue acknowledged but intentionally deferred (add rationale in Notes)
+- [ ] **WONTFIX** — issue acknowledged but will not be fixed (add rationale in Notes)
+- [ ] **REJECT** — issue invalid, not a problem, or already addressed
+- [ ] **DUPLICATE** — issue duplicates another existing issue (reference in Notes)
 - **Notes:**
 
 ---
