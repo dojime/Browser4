@@ -382,6 +382,7 @@ public class NativeCommandOutputHandler
     private int _ringIndex;
     private int _ringCount;
     private readonly object _lock;
+    private int _eofCount;
 
     // ── Checkpoint support ──────────────────────────────────────────────
     private readonly string _checkpointDir;
@@ -425,7 +426,16 @@ public class NativeCommandOutputHandler
 
     public void OnOutputReceived(object sender, System.Diagnostics.DataReceivedEventArgs e)
     {
-        if (e.Data == null) return;
+        // A null Data (or a null event args) marks EOF for this stream.  EOF is
+        // what tells Start-NativeCommand the pipes can no longer deliver output,
+        // so it is counted instead of being dropped: waiting for it is how the
+        // drain knows the async handlers are done (see
+        // Wait-NativeCommandOutputDrain).
+        if (e == null || e.Data == null)
+        {
+            lock (_lock) { _eofCount++; }
+            return;
+        }
 
         Console.WriteLine(e.Data);
         try
@@ -623,6 +633,16 @@ public class NativeCommandOutputHandler
             }
             return sb.ToString();
         }
+    }
+
+    /// <summary>
+    /// Returns the number of streams that reached EOF (0, 1 or 2).
+    /// Wait-NativeCommandOutputDrain waits for 2 — the point at which the
+    /// async handlers have delivered everything the pipes can deliver.
+    /// </summary>
+    public int EofCount
+    {
+        get { lock (_lock) { return _eofCount; } }
     }
 
     /// <summary>
@@ -2014,6 +2034,60 @@ function Write-IssuesToDraft {
     }
 }
 
+function Wait-NativeCommandOutputDrain {
+    <#
+    .SYNOPSIS
+        Wait for a command's stdout/stderr pipes to reach EOF, but never forever.
+
+    .DESCRIPTION
+        Start-NativeCommand redirects the child's stdout/stderr into anonymous
+        pipes, and EOF on those pipes is the only signal that the async
+        DataReceived handlers have delivered everything.  Every write end must be
+        closed for EOF to happen, and descendants that inherited them outlive the
+        child by design: the Browser4 JVM, headless Chrome, an MCP server an
+        agent left running.  The old drain called Process.WaitForExit()
+        (parameterless) — which also waits for the async readers to reach EOF —
+        so a task runner could park there for as long as any leftover descendant
+        lived, and Ctrl+C cannot break a thread blocked in that native wait.
+
+        This helper returns as soon as both streams reported EOF or the deadline
+        expires, whichever comes first, so the caller always gets control back.
+
+    .PARAMETER Handler
+        The NativeCommandOutputHandler instance wired to the process.  It counts
+        EOF per stream via EofCount.
+
+    .PARAMETER TimeoutSec
+        Maximum seconds to wait for EOF.  0 returns immediately.
+
+    .OUTPUTS
+        Boolean — $true when the deadline expired before both streams hit EOF.
+    #>
+    param(
+        [Parameter(Mandatory = $true)] $Handler,
+        [double] $TimeoutSec = 10
+    )
+
+    # A session that survived a git checkout can still hold the handler type from
+    # before EofCount existed (see the type check above) — degrade to the old
+    # short grace period instead of waiting for a counter that never moves.
+    if ($null -eq $Handler.PSObject.Properties['EofCount']) {
+        Start-Sleep -Milliseconds 300
+        return $true
+    }
+
+    if ($TimeoutSec -le 0) {
+        return ($Handler.EofCount -lt 2)
+    }
+
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSec)
+    while ($Handler.EofCount -lt 2 -and [DateTime]::UtcNow -lt $deadline) {
+        Start-Sleep -Milliseconds 50
+    }
+
+    return ($Handler.EofCount -lt 2)
+}
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Safe native-command invocation
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2040,6 +2114,10 @@ function Write-IssuesToDraft {
 # it impossible to print "still running" messages while the child process was
 # alive but not emitting output.  The polling loop in WaitForExit(timeout)
 # gives us a natural heartbeat cadence.
+#
+# The trailing drain is bounded (Wait-NativeCommandOutputDrain): the
+# parameterless WaitForExit() also waits for stream EOF, which never arrives
+# while a descendant that inherited the pipes (JVM, headless Chrome) is alive.
 
 function Start-NativeCommand {
     <#
@@ -2055,6 +2133,10 @@ function Start-NativeCommand {
         Replaces the old pipeline-based approach (& cmd 2>&1 | ForEach-Object)
         which blocked the PowerShell thread and offered no way to report progress
         while the child process was running but not yet emitting output.
+
+        Returns as soon as the command exited: the trailing drain of the output
+        pipes is bounded (Wait-NativeCommandOutputDrain), because descendants that
+        inherited them can keep them open indefinitely.
 
     .PARAMETER FilePath
         Path to the native executable.
@@ -2072,6 +2154,10 @@ function Start-NativeCommand {
     .PARAMETER HeartbeatIntervalSec
         Seconds between "still running" messages when no output is produced
         (default 10).  Set to 0 to disable heartbeats.
+
+    .PARAMETER DrainTimeoutSec
+        Maximum seconds to wait for the output pipes to reach EOF after the
+        command exited (default 10).
 
     .EXAMPLE
         Start-NativeCommand -FilePath 'claude' -ArgumentList @('-p', $prompt) `
@@ -2097,6 +2183,12 @@ function Start-NativeCommand {
         # 0 (default) means no timeout.  Exit code 124 is returned on timeout
         # (matching the Unix `timeout` command convention).
         [int] $TimeoutSeconds = 0,
+
+        # Maximum seconds to wait for the command's output pipes to reach EOF
+        # after it exited.  Descendants that inherited those pipes (JVM, headless
+        # Chrome) can hold them open long after the command is gone, so the drain
+        # is bounded.  See Wait-NativeCommandOutputDrain.
+        [double] $DrainTimeoutSec = 10,
 
         # ── Checkpoint support ──────────────────────────────────────────
         # When both parameters are provided the output handler writes a
@@ -2396,11 +2488,19 @@ function Start-NativeCommand {
 
         # ── Drain final output ─────────────────────────────────────────────
         # The process has exited but async reads may still have data in flight.
-        # WaitForExit() (parameterless) blocks until all OutputDataReceived /
-        # ErrorDataReceived event handlers have finished processing — without
-        # this, CancelOutputRead() may discard data that hasn't been delivered
-        # yet, losing most of the captured output.
-        try { $proc.WaitForExit() } catch { }
+        # Waiting for stream EOF means every OutputDataReceived / ErrorDataReceived
+        # handler has finished processing — without this, CancelOutputRead() may
+        # discard data that hasn't been delivered yet, losing most of the captured
+        # output.
+        #
+        # The wait is bounded on purpose: EOF requires every write end of the
+        # pipes to be closed, including the copies inherited by descendants that
+        # outlive the command (JVM, headless Chrome, a leftover MCP server).  See
+        # Wait-NativeCommandOutputDrain.
+        $drainTimedOut = Wait-NativeCommandOutputDrain -Handler $nativeHandler -TimeoutSec $DrainTimeoutSec
+        if ($drainTimedOut) {
+            [Console]::WriteLine("  · note: the command exited, but its output pipes are still held open after ${DrainTimeoutSec}s (a leftover descendant inherited them) — continuing without them.")
+        }
 
         # Cancel the async readers, then drain synchronously to capture
         # everything that remains.

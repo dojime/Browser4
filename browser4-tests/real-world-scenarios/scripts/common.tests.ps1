@@ -1500,30 +1500,37 @@ Write-Host '━━━ Start-NativeCommand: WaitForExit Fix ━━━' -Foregroun
     Write-TestGroup 'Start-NativeCommand function exists'
     Assert-True 'Function is defined' ($null -ne (Get-Command Start-NativeCommand -ErrorAction SilentlyContinue))
 
-    # Static analysis: verify the parameterless WaitForExit() call exists
-    # after the heartbeat loop and before CancelOutputRead()
+    # Static analysis: the drain must wait for stream EOF — with a deadline —
+    # after the heartbeat loop and before CancelOutputRead().
     $commonPath = Join-Path $PSScriptRoot 'common.ps1'
     $commonContent = Get-Content -LiteralPath $commonPath -Raw -Encoding UTF8
 
-    Write-TestGroup 'Parameterless WaitForExit() is called before CancelOutputRead'
+    Write-TestGroup 'Output drain waits for EOF with a deadline'
     # Extract the drain section between the heartbeat loop and the timeout check
     $drainSection = ''
     if ($commonContent -match '(?s)# ── Drain final output.+?# ── Timeout:') {
         $drainSection = $Matches[0]
     }
-    $hasWaitForExit = $drainSection -match '\$proc\.WaitForExit\(\)'
-    Assert-True 'WaitForExit() (parameterless) is called in drain section' $hasWaitForExit
+    Assert-True 'Drain section found' ($drainSection.Length -gt 0)
+    Assert-True 'Drain calls the bounded EOF wait' ($drainSection -match 'Wait-NativeCommandOutputDrain')
+    Assert-True 'Wait-NativeCommandOutputDrain is bounded by a deadline' `
+        ($commonContent -match 'AddSeconds\(\$TimeoutSec\)')
+    Assert-True 'Handler counts stream EOF' ($commonContent -match 'public int EofCount')
 
-    Write-TestGroup 'WaitForExit() is called BEFORE CancelOutputRead (code calls)'
+    Write-TestGroup 'Output drain does NOT call the unbounded WaitForExit()'
+    # Regression guard: the parameterless overload also waits for the async
+    # readers to reach EOF, which never happens while a descendant that
+    # inherited the pipes (JVM, headless Chrome) is alive — that parked the
+    # runner with no way to interrupt it.
+    Assert-True 'No unbounded $proc.WaitForExit() in the drain section' `
+        (-not ($drainSection -match '\$proc\.WaitForExit\(\)'))
+
+    Write-TestGroup 'EOF wait happens BEFORE CancelOutputRead (code calls)'
     # Use $proc. prefix to avoid matching comment text like
     # "CancelOutputRead() may discard data that hasn't been delivered"
-    $waitPos = $drainSection.IndexOf('$proc.WaitForExit()')
+    $waitPos = $drainSection.IndexOf('Wait-NativeCommandOutputDrain')
     $cancelPos = $drainSection.IndexOf('$proc.CancelOutputRead()')
-    Assert-True 'WaitForExit() appears before CancelOutputRead()' ($waitPos -ge 0 -and $cancelPos -ge 0 -and $waitPos -lt $cancelPos)
-
-    Write-TestGroup 'WaitForExit() is wrapped in try-catch'
-    $hasTryCatch = $drainSection -match '(?s)try\s*\{\s*\$proc\.WaitForExit\(\)'
-    Assert-True 'WaitForExit() is wrapped in try-catch' $hasTryCatch
+    Assert-True 'EOF wait appears before CancelOutputRead()' ($waitPos -ge 0 -and $cancelPos -ge 0 -and $waitPos -lt $cancelPos)
 
     Write-TestGroup 'Heartbeat loop polls HasExited before the drain section'
     $hasHeartbeatLoop = $commonContent -match 'while\s*\(-not\s*\$proc\.HasExited\)'
@@ -1531,6 +1538,38 @@ Write-Host '━━━ Start-NativeCommand: WaitForExit Fix ━━━' -Foregroun
 
     Write-TestGroup 'C# handler has try-catch for File.AppendAllText'
     Assert-True 'Handler has try-catch' ($commonContent -match '(?s)try\s*\{.*File\.AppendAllText')
+
+    Write-TestGroup 'Start-NativeCommand returns while a grandchild holds the pipes'
+    # Behavioural guard: the command's grandchild inherits the redirected
+    # stdout/stderr, so the pipes stay open after the command exits.  The call
+    # must still come back, bounded by -DrainTimeoutSec.
+    $holderDir = Join-Path ([System.IO.Path]::GetTempPath()) ("b4-native-holder-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    $null = New-Item -ItemType Directory -Path $holderDir -Force
+    $holderChild = Join-Path $holderDir 'holder-child.ps1'
+    @'
+Write-Output 'native-holder-line-one'
+$exe = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+$null = Start-Process -FilePath $exe -ArgumentList @('-NoProfile', '-Command', 'Start-Sleep -Seconds 15') -NoNewWindow -PassThru
+Write-Output 'native-holder-line-two'
+'@ | Set-Content -LiteralPath $holderChild -Encoding utf8
+
+    $holderCapture = Join-Path $holderDir 'holder.log'
+    $holderExe = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+    $holderWatch = [Diagnostics.Stopwatch]::StartNew()
+    $holderOutput = Start-NativeCommand -FilePath $holderExe `
+        -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $holderChild) `
+        -CaptureFile $holderCapture -HeartbeatIntervalSec 0 -DrainTimeoutSec 3 -PassThru
+    $holderWatch.Stop()
+
+    Assert-True 'Start-NativeCommand returned in bounded time (< 12s)' ($holderWatch.Elapsed.TotalSeconds -lt 12)
+    $holderText = "$holderOutput"
+    Assert-True 'Captured output contains both command lines' `
+        ($holderText.Contains('native-holder-line-one') -and $holderText.Contains('native-holder-line-two'))
+    # The "pipes are still held open" note goes to the console (not to the
+    # capture file, which must stay parseable output), so pin the message itself.
+    Assert-True 'Runner explains that the pipes are still held open' `
+        ($commonContent -match 'output pipes are still held open')
+    Remove-Item -LiteralPath $holderDir -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
