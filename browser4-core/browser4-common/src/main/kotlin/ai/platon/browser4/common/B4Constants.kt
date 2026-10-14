@@ -59,6 +59,24 @@ object B4Constants {
     /** Default of [FOCUS_EMULATION]; pinned by B4ConstantsTest. */
     const val FOCUS_EMULATION_DEFAULT = true
 
+    /**
+     * Whether the user's own Chrome extensions are inherited by a Browser4-launched browser
+     * (`true`, the default) or disabled (`false`).
+     *
+     * Extensions arrive through the browser profile: a privacy context copies the prototype
+     * data dir, so the user's extensions live in `Default/Extensions` of every copied
+     * profile. A live extension runs its content script in the page, and Chromium then
+     * installs the `chrome.runtime` skeleton in the page's main world — a shape bot
+     * detectors sample (ipfighter reports `chrome.runtime.sendMessage` as a prototype leak;
+     * a plain Chrome 155 with a clean profile and `--disable-extensions` never exposes it).
+     *
+     * `false` adds `--disable-extensions` at the single launch funnel and leaves every
+     * automation-facing feature untouched (it is not a stealth switch).
+     */
+    const val EXTENSIONS_INHERIT = "browser.extensions.inherit"
+
+    /** Default of [EXTENSIONS_INHERIT]; pinned by B4ConstantsTest. */
+    const val EXTENSIONS_INHERIT_DEFAULT = true
 
     const val SESSION_ID_CAPABILITY = "sessionId"
     const val PROFILE_MODE_CAPABILITY = "profileMode"
