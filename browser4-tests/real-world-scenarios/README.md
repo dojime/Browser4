@@ -18,6 +18,62 @@ the configured agent CLI (`claude`, `kimi`, `opencode`, `codex`, or `dsh`, auto-
 in that order). Set `$env:BROWSER4_AGENT` globally or `$script:scenarioAgentCli`
 per-script to force a specific backend. The `-Agent` CLI parameter overrides both.
 
+## Agent client diagnostics (Claude Code)
+
+The runner puts the agent client's host environment right **before** it launches
+the agent, because two Claude Code diagnostics otherwise open every captured
+artifact (`target/<timestamp>-<scenario>.raw.md`) and dominate the heartbeat
+tail. A workspace that has never been opened interactively produces exactly these
+two lines on every run:
+
+```
+Ignoring 13 permissions.allow entries from .claude/settings.json: this workspace
+has not been trusted. Run Claude Code interactively here once and accept the
+trust dialog, or set projects["D:/…"].hasTrustDialogAccepted: true in
+C:\Users\pereg\.claude.json.
+[claude-code:unrecognized_model] {"model":"deepseek-v4-flash[1m]","query_source":"sdk"}
+```
+
+Both describe the host machine, not the scenario, and both silently degrade a run:
+
+| Diagnostic | Why it matters | What the harness does |
+|---|---|---|
+| Workspace not trusted | Claude Code discards the permission allowlist in `.claude/settings.json`, so the agent and its sub-agents run under a different permission set than the project configures. Every fresh clone or git worktree starts in this state. | Writes `projects["<repo root>"].hasTrustDialogAccepted = true` into `~/.claude.json` (or `$CLAUDE_CONFIG_DIR/.claude.json`) before launching `claude` — exactly what the warning instructs. The write is atomic, preserves every other key, and is skipped entirely when the project declares no `.claude/settings.json` / `settings.local.json`, or is already trusted. |
+| Model missing from Claude Code's catalog | Claude Code cannot find the model and falls back to a 200k context window, so auto-compact can fire in the middle of a 20–40 minute evaluation and quietly drop the context it depends on. | Exports `CLAUDE_CODE_MAX_CONTEXT_TOKENS` derived from the window declared in the model name (`…[1M]` → `1000000`, `…[200k]` → `200000`) unless the variable is already set. The harness reads the model name; it never chooses the model. |
+
+Set `BROWSER4_SKIP_AGENT_ENV_SETUP=1` to keep the harness out of the Claude Code
+configuration completely — CI, or a developer who manages trust by hand. The unit
+suite sets it for the same reason.
+
+`CLAUDE_CODE_MAX_CONTEXT_TOKENS` removes the 200k auto-compact window but **not**
+the `[claude-code:unrecognized_model]` line itself; that one is only silenced by
+mapping the model in your own Claude Code settings (a `modelOverrides` /
+`behavesAs` entry, or appending `[1m]` to the model name). Whichever way it is
+configured, the runner reports what the client complained about at the end of a
+run — `N agent-client diagnostic line(s) captured — host environment, not agent
+findings:` — so client noise can never pass for agent output or a Browser4
+finding.
+
+## Console encoding (UTF-8)
+
+Every script here pins `[Console]::OutputEncoding` to UTF-8 as it loads
+(`common.ps1` for the whole module, `bin/test.ps1` for its own process). A
+redirected stream otherwise starts on the Windows OEM code page: a pwsh child on
+a CP936 host writes `·` as `A1 A4` and `═` as `A8 54`, and a UTF-8 reader — the
+relay's `StandardOutputEncoding`, a CI log, the DeepSeek harness capture —
+renders those as `??` and `?T`. That is how a heartbeat/tail block degrades into
+
+```
+  ?T?T last 10 lines ?T?T
+  ?? claude --dangerously-skip-permissions ?? running (0m 30s elapsed, heartbeat #1)
+```
+
+The relay decodes children as UTF-8, so the child is the side that has to
+agree — `common.ps1` pins it for every script that dot-sources the module, and
+all of them do so before their first write. `common.tests.ps1` group 29 asserts
+both halves: that loading the module forces code page 65001, and that the exact
+decoration bytes survive a real capture (no `U+FFFD`, no `U+FFFD + T`).
+
 ## Anatomy of a task file
 
 Task files live in `tasks/` and follow this format:

@@ -33,6 +33,13 @@ This prevents test state from leaking between test groups.
 
 $ErrorActionPreference = 'Stop'
 
+# The harness trusts the workspace and declares the agent client's context
+# window before it launches the agent.  Unit tests must never touch a
+# developer's real Claude Code configuration, so the opt-out is set for the
+# whole test process; the environment tests (group 28) pass -Force and their own
+# temp paths to exercise the logic.
+$env:BROWSER4_SKIP_AGENT_ENV_SETUP = '1'
+
 # Trap any terminating error so the failure details are visible in CI/test-runner
 # output.  Without this, an unhandled error silently kills the script with exit
 # code 1 and the runner only sees "(exit 1)" with no clue about what happened.
@@ -2365,6 +2372,268 @@ Write-Host '━━━ $generalPrompt / JSON Format Section ━━━' -Foregroun
 
     Write-TestGroup 'Prompt still contains D. Overall Assessment section'
     Assert-True 'Contains D. Overall Assessment' $generalPrompt.Contains('### D. Overall Assessment')
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Test group 28: Agent client environment & client-side diagnostics
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Regression cover for the two Claude Code diagnostics that used to open every
+# captured artifact of a fresh workspace:
+#
+#   Ignoring 13 permissions.allow entries from .claude/settings.json: this
+#   workspace has not been trusted. …
+#   [claude-code:unrecognized_model] {"model":"deepseek-v4-flash[1m]",…}
+#
+# The fixtures below are the real lines from such a run.
+
+Write-Host ''
+Write-Host '━━━ Agent Client Environment & Diagnostics ━━━' -ForegroundColor Yellow
+
+& {
+    $browser4cliMode = 'dev'
+    . "$PSScriptRoot/common.ps1"
+
+    $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) "b4cli-agent-env-$(Get-Random)"
+    $wsDir = Join-Path $tempDir 'ws'
+    $wsPlainDir = Join-Path $tempDir 'ws-plain'
+    $configPath = Join-Path $tempDir '.claude.json'
+    $settingsPath = Join-Path $tempDir 'settings.json'
+    New-Item -ItemType Directory -Path (Join-Path $wsDir '.claude') -Force | Out-Null
+    New-Item -ItemType Directory -Path $wsPlainDir -Force | Out-Null
+
+    # ── Project key ─────────────────────────────────────────────────────────
+    Write-TestGroup 'Get-ClaudeProjectKey — Claude Code project key format'
+    $expectedKey = [System.IO.Path]::GetFullPath($wsDir).Replace('\', '/')
+    Assert-Equal 'Absolute path, forward slashes, no trailing separator' `
+        $expectedKey (Get-ClaudeProjectKey -WorkspaceRoot $wsDir)
+    Assert-True 'No backslashes in the key' ((Get-ClaudeProjectKey -WorkspaceRoot $wsDir) -notmatch '\\')
+    Assert-True 'No trailing slash in the key' (-not (Get-ClaudeProjectKey -WorkspaceRoot $wsDir).EndsWith('/'))
+
+    # ── Context window from the model name ──────────────────────────────────
+    Write-TestGroup 'Get-ClaudeContextTokens — declared context window'
+    Assert-Equal '[1m] → 1M' 1000000 (Get-ClaudeContextTokens -Model 'deepseek-v4-flash[1m]')
+    Assert-Equal '[1M] → 1M' 1000000 (Get-ClaudeContextTokens -Model 'deepseek-v4-flash[1M]')
+    Assert-Equal '[200k] → 200k' 200000 (Get-ClaudeContextTokens -Model 'some-model[200k]')
+    Assert-Equal '[1.5m] → 1.5M' 1500000 (Get-ClaudeContextTokens -Model 'some-model[1.5m]')
+    Assert-Equal 'No suffix → 0 (never invented)' 0 (Get-ClaudeContextTokens -Model 'deepseek-v4-flash')
+    Assert-Equal 'Empty → 0' 0 (Get-ClaudeContextTokens -Model '')
+    Assert-Equal 'Non-numeric suffix → 0' 0 (Get-ClaudeContextTokens -Model 'some-model[big]')
+
+    # ── Trust state ─────────────────────────────────────────────────────────
+    Write-TestGroup 'Test-ClaudeWorkspaceTrusted — missing / untrusted / trusted'
+    Assert-True 'Missing config file → not trusted' `
+        (-not (Test-ClaudeWorkspaceTrusted -ConfigPath $configPath -WorkspaceRoot $wsDir))
+
+    [System.IO.File]::WriteAllText($configPath, '{"projects":{"D:/other":{"hasTrustDialogAccepted":true}}}')
+    Assert-True 'Only another project trusted → not trusted' `
+        (-not (Test-ClaudeWorkspaceTrusted -ConfigPath $configPath -WorkspaceRoot $wsDir))
+
+    [System.IO.File]::WriteAllText($configPath, '{"projects":{"D:/other":{"hasTrustDialogAccepted":true}}}')
+    $null = Set-ClaudeWorkspaceTrusted -ConfigPath $configPath -WorkspaceRoot $wsDir
+    Assert-True 'Flag written → trusted' `
+        (Test-ClaudeWorkspaceTrusted -ConfigPath $configPath -WorkspaceRoot $wsDir)
+
+    [System.IO.File]::WriteAllText($configPath, '{"projects":{"' + $expectedKey + '":{"hasTrustDialogAccepted":false}}}')
+    Assert-True 'Explicit false → not trusted' `
+        (-not (Test-ClaudeWorkspaceTrusted -ConfigPath $configPath -WorkspaceRoot $wsDir))
+
+    [System.IO.File]::WriteAllText($configPath, '{ this is not json')
+    Assert-True 'Malformed config → not trusted, no throw' `
+        (-not (Test-ClaudeWorkspaceTrusted -ConfigPath $configPath -WorkspaceRoot $wsDir))
+
+    # ── Trust write ─────────────────────────────────────────────────────────
+    Write-TestGroup 'Set-ClaudeWorkspaceTrusted — writes the flag, preserves the file'
+    [System.IO.File]::WriteAllText($configPath,
+        '{"userID":"abc","projects":{"D:/other":{"hasTrustDialogAccepted":true,"history":[1,2,3]}}}')
+    Assert-True 'First write reports a change' `
+        (Set-ClaudeWorkspaceTrusted -ConfigPath $configPath -WorkspaceRoot $wsDir)
+    Assert-True 'Second write is a no-op' `
+        (-not (Set-ClaudeWorkspaceTrusted -ConfigPath $configPath -WorkspaceRoot $wsDir))
+
+    $written = [System.IO.File]::ReadAllText($configPath) | ConvertFrom-Json
+    Assert-True 'Unrelated top-level key preserved' ($written.userID -eq 'abc')
+    Assert-True 'Other project entry preserved' ($written.projects.'D:/other'.hasTrustDialogAccepted -eq $true)
+    Assert-Equal 'Deep nested value survives the round-trip' '1,2,3' ($written.projects.'D:/other'.history -join ',')
+    Assert-True 'This project is now trusted' ($written.projects.$expectedKey.hasTrustDialogAccepted -eq $true)
+
+    $badConfig = Join-Path $tempDir 'bad.json'
+    [System.IO.File]::WriteAllText($badConfig, '{ this is not json')
+    # 6>$null: the helper is expected to report the unreadable config; the
+    # assertion below is about its return value, not about that report.
+    Assert-True 'Malformed config cannot be trusted' `
+        (-not (Set-ClaudeWorkspaceTrusted -ConfigPath $badConfig -WorkspaceRoot $wsDir 6>$null))
+    Assert-Equal 'Malformed config is left untouched' '{ this is not json' `
+        ([System.IO.File]::ReadAllText($badConfig))
+    Assert-True 'Missing config file cannot be trusted' `
+        (-not (Set-ClaudeWorkspaceTrusted -ConfigPath (Join-Path $tempDir 'nope.json') -WorkspaceRoot $wsDir))
+
+    # ── Initialize-AgentEnvironment ─────────────────────────────────────────
+    Write-TestGroup 'Initialize-AgentEnvironment — scoped, opt-out aware'
+    Remove-Item -LiteralPath $configPath -Force -ErrorAction SilentlyContinue
+    [System.IO.File]::WriteAllText($configPath, '{"projects":{}}')
+
+    $noop = Initialize-AgentEnvironment -Agent kimi -WorkspaceRoot $wsDir -ConfigPath $configPath `
+        -SettingsPath $settingsPath -Force -Silent
+    Assert-True 'Non-claude agent is a no-op' `
+        ((-not $noop.Trusted) -and ($noop.ContextTokens -eq 0) -and (-not $noop.Skipped))
+
+    $skipped = Initialize-AgentEnvironment -Agent claude -WorkspaceRoot $wsDir -ConfigPath $configPath `
+        -SettingsPath $settingsPath -Silent
+    Assert-True 'BROWSER4_SKIP_AGENT_ENV_SETUP=1 skips everything' `
+        ($skipped.Skipped -and (-not $skipped.Trusted) -and ($skipped.ContextTokens -eq 0))
+
+    $plain = Initialize-AgentEnvironment -Agent claude -WorkspaceRoot $wsPlainDir -ConfigPath $configPath `
+        -SettingsPath $settingsPath -Force -Silent
+    Assert-True 'Workspace without .claude/settings.json is not written' (-not $plain.Trusted)
+    Assert-True 'And its config is untouched' `
+        ((([System.IO.File]::ReadAllText($configPath) | ConvertFrom-Json).projects.PSObject.Properties |
+            Measure-Object).Count -eq 0)
+
+    # settings.local.json is gated by the same trust flag, so it must count too.
+    New-Item -ItemType Directory -Path (Join-Path $wsPlainDir '.claude') -Force | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $wsPlainDir '.claude/settings.local.json'), '{"permissions":{"allow":["WebSearch"]}}')
+    $localOnly = Initialize-AgentEnvironment -Agent claude -WorkspaceRoot $wsPlainDir -ConfigPath $configPath `
+        -SettingsPath $settingsPath -Force -Silent
+    Assert-True 'settings.local.json alone is enough to trust the workspace' $localOnly.Trusted
+    Remove-Item -Recurse -Force (Join-Path $wsPlainDir '.claude') -ErrorAction SilentlyContinue
+    [System.IO.File]::WriteAllText($configPath, '{"projects":{}}')
+
+    [System.IO.File]::WriteAllText((Join-Path $wsDir '.claude/settings.json'),
+        '{"permissions":{"allow":["Bash(git *)"]}}')
+    [System.IO.File]::WriteAllText($settingsPath, '{"model":"deepseek-v4-flash","env":{"ANTHROPIC_MODEL":"deepseek-v4-flash[1M]"}}')
+    $env:CLAUDE_CODE_MAX_CONTEXT_TOKENS = ''
+    $applied = Initialize-AgentEnvironment -Agent claude -WorkspaceRoot $wsDir -ConfigPath $configPath `
+        -SettingsPath $settingsPath -Force -Silent
+    Assert-True 'Workspace with project permissions is trusted' $applied.Trusted
+    Assert-Equal 'Declared [1M] window is applied' 1000000 $applied.ContextTokens
+    Assert-Equal 'Context window reaches the child environment' '1000000' $env:CLAUDE_CODE_MAX_CONTEXT_TOKENS
+
+    $env:CLAUDE_CODE_MAX_CONTEXT_TOKENS = '424242'
+    $preserved = Initialize-AgentEnvironment -Agent claude -WorkspaceRoot $wsDir -ConfigPath $configPath `
+        -SettingsPath $settingsPath -Force -Silent
+    Assert-Equal 'An explicit value is never overridden' '424242' $env:CLAUDE_CODE_MAX_CONTEXT_TOKENS
+    Assert-Equal 'And is not reported as applied' 0 $preserved.ContextTokens
+    $env:CLAUDE_CODE_MAX_CONTEXT_TOKENS = ''
+
+    # ── Client diagnostics ──────────────────────────────────────────────────
+    Write-TestGroup 'Get-AgentClientDiagnostics — host noise vs agent output'
+    $captured = @'
+Ignoring 13 permissions.allow entries from .claude/settings.json: this workspace has not been trusted. Run Claude Code interactively here once and accept the trust dialog, or set projects["D:/workspace/Browser4/Browser4-4.14"].hasTrustDialogAccepted: true in C:\Users\pereg\.claude.json.
+[claude-code:unrecognized_model] {"model":"deepseek-v4-flash[1m]","query_source":"sdk"}
+## A. Task Result
+
+All 9 task steps completed successfully.
+'@
+    $diags = @(Get-AgentClientDiagnostics -Content $captured)
+    Assert-Equal 'Both client diagnostics are found' 2 $diags.Count
+    Assert-True 'Trust warning is classified' ($diags[0] -match 'has not been trusted')
+    Assert-True 'Unknown-model report is classified' ($diags[1] -match 'unrecognized_model')
+    Assert-Equal 'Clean agent output yields nothing' 0 `
+        (@(Get-AgentClientDiagnostics -Content $captured.Split("`n")[2..5] -join "`n")).Count
+    Assert-Equal 'Empty content yields nothing' 0 (@(Get-AgentClientDiagnostics -Content '')).Count
+    Assert-Equal 'Long-form model warning is classified' 1 (@(Get-AgentClientDiagnostics -Content `
+        ('"deepseek-v4-flash" isn''t described by this version''s model catalog; update Claude Code.')).Count)
+
+    # ── Wiring: Invoke-Agent reports what the client complained about ───────
+    Write-TestGroup 'Invoke-Agent — reports client diagnostics from the capture'
+    $captureFile = Join-Path $tempDir 'capture.raw.md'
+    [System.IO.File]::WriteAllText($captureFile, $captured)
+
+    function Start-NativeCommand {
+        param(
+            [string]$FilePath,
+            [string[]]$ArgumentList,
+            [string]$CaptureFile,
+            [int]$TimeoutSeconds,
+            [string]$CheckpointDir,
+            [string]$CheckpointScenario
+        )
+        # The capture was written up front — nothing to run for real.
+        return 0
+    }
+    function Get-ScenarioAgent { return 'claude' }
+
+    $output = Invoke-Agent -Prompt 'diagnostic wiring probe' -OutputFile $captureFile 6>&1 | Out-String
+    Assert-Contains 'Client diagnostics are surfaced' $output 'agent-client diagnostic line(s) captured'
+    Assert-Contains 'The report points at the documentation' $output 'README.md'
+    Assert-Contains 'The trust warning is echoed, not buried' $output 'has not been trusted'
+    Assert-Contains 'The unknown-model report is echoed' $output 'unrecognized_model'
+
+    Remove-Item function:Start-NativeCommand -ErrorAction SilentlyContinue
+    Remove-Item function:Get-ScenarioAgent -ErrorAction SilentlyContinue
+    Remove-Item -Recurse -Force $tempDir -ErrorAction SilentlyContinue
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Test group 29: Console encoding — the harness must emit UTF-8
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Regression cover for the mojibake that turned a scenario log into line noise:
+# a pwsh child on a CP936 host writes the OEM code page (· → A1 A4, ═ → A8 54)
+# while bin/test.ps1's relay decodes children as UTF-8, so "══ last 10 lines ══"
+# was captured as "?T?T last 10 lines ?T?T" and "·" / "—" / "│" as "??".
+# Dot-sourcing common.ps1 must pin the process to UTF-8, and the bytes that
+# reach a capture file must be intact.
+
+Write-Host ''
+Write-Host '━━━ Console Encoding: UTF-8 Output ━━━' -ForegroundColor Yellow
+
+& {
+    $browser4cliMode = 'dev'
+    . "$PSScriptRoot/common.ps1"
+
+    $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) "b4cli-encoding-$(Get-Random)"
+    New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
+
+    $commonPs1 = (Join-Path $PSScriptRoot 'common.ps1').Replace("'", "''")
+
+    # ── Dot-sourcing the module pins the console encoding ───────────────────
+    Write-TestGroup 'common.ps1 pins [Console]::OutputEncoding to UTF-8'
+    $probeScript = Join-Path $tempDir 'encoding-pin-probe.ps1'
+    $probeBody = @'
+if ($IsWindows -or $env:OS -eq 'Windows_NT') {
+    try { [Console]::OutputEncoding = [System.Text.Encoding]::GetEncoding(936) } catch { }
+}
+$before = [Console]::OutputEncoding.CodePage
+. '__COMMON__'
+"PROBE before=$before after=$([Console]::OutputEncoding.CodePage) name=$([Console]::OutputEncoding.WebName)"
+'@.Replace('__COMMON__', $commonPs1)
+    [System.IO.File]::WriteAllText($probeScript, $probeBody, [System.Text.UTF8Encoding]::new($false))
+
+    $probeOutput = & pwsh -NoProfile -File $probeScript 2>&1 | Out-String
+    Assert-Contains 'Module load forces code page 65001' $probeOutput 'after=65001'
+    Assert-Contains 'Module load reports utf-8' $probeOutput 'name=utf-8'
+
+    # ── The bytes that reach a capture file survive the relay ───────────────
+    Write-TestGroup 'Start-NativeCommand captures UTF-8 decoration intact'
+    $childScript = Join-Path $tempDir 'encoding-child.ps1'
+    $childBody = @'
+. '__COMMON__'
+[Console]::WriteLine('  ══ last 10 lines ══')
+[Console]::WriteLine('  · claude — running (0m 30s elapsed, heartbeat #1)')
+[Console]::WriteLine('  │ [claude-code:unrecognized_model] {"model":"deepseek-v4-flash[1m]"}')
+[Console]::WriteLine('  ══════════════════')
+'@.Replace('__COMMON__', $commonPs1)
+    [System.IO.File]::WriteAllText($childScript, $childBody, [System.Text.UTF8Encoding]::new($false))
+
+    $capture = Join-Path $tempDir 'encoding.raw.txt'
+    $exitCode = Start-NativeCommand -FilePath 'pwsh' `
+        -ArgumentList @('-NoProfile', '-File', $childScript) `
+        -CaptureFile $capture -HeartbeatIntervalSec 0
+    $captured = [System.Text.Encoding]::UTF8.GetString([System.IO.File]::ReadAllBytes($capture))
+
+    Assert-Equal 'Encoding child exited cleanly' 0 $exitCode
+    Assert-Contains 'Box-drawing rule survives' $captured '══ last 10 lines ══'
+    Assert-Contains 'Middot and em dash survive' $captured '· claude — running'
+    Assert-Contains 'Tail bar survives' $captured '│ [claude-code:unrecognized_model]'
+    Assert-True 'No replacement characters in the capture' (-not $captured.Contains([char]0xFFFD))
+    # CP936 encodes ═ as A8 54, so a UTF-8 reader sees U+FFFD followed by a bare
+    # 'T' — the "?T?T" in the reported log.  Assert the exact signature.
+    $boxArtifact = [string][char]0xFFFD + 'T'
+    Assert-True 'No CP936 box-drawing artifact (U+FFFD + T)' (-not $captured.Contains($boxArtifact))
+
+    Remove-Item -Recurse -Force $tempDir -ErrorAction SilentlyContinue
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════

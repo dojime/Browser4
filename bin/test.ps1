@@ -26,6 +26,24 @@ $script:NoSession = $NoSession
 $script:BuildBackend = $BuildBackend
 $script:SessionPath = $SessionPath
 
+# ── Console encoding: always UTF-8 ────────────────────────────────────────────
+# A redirected stream starts on the Windows OEM code page (CP936 on a Chinese
+# host), while everything downstream — the relayed child output, this runner's
+# own banners and heartbeats, CI logs, the DeepSeek harness capture — reads
+# UTF-8.  Under CP936 the decoration turns into line noise: "·" and "—" become
+# "??" (A1 A4 / A1 AA read as UTF-8) and "═" becomes "?T" (A8 54 — the 0x54 is a
+# literal 'T'), which is how a tail block degrades into "?T?T last 10 lines
+# ?T?T".  The `ps` subcommand already does this for its children and restores
+# the old value afterwards; doing it once here keeps parent and child on the
+# same encoding for every subcommand.
+try {
+    if ([Console]::OutputEncoding.CodePage -ne 65001) {
+        [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+    }
+} catch {
+    # A host without a usable console must not fail the run over an encoding.
+}
+
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot = (git rev-parse --show-toplevel 2>$null)
 
