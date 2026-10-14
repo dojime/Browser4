@@ -945,6 +945,62 @@ $muteOutput = & {
 $muteResult = @($muteOutput | Where-Object { $_ -is [hashtable] })[0]
 Assert-Returns -Label 'Relay: silent child reports zero output lines' -Actual $muteResult.OutputLines -Expected 0
 Assert-Returns -Label 'Relay: silent child still reports its exit code' -Actual $muteResult.ExitCode -Expected 0
+Assert-Returns -Label 'Relay: healthy console reports no echo failures' -Actual $muteResult.ConsoleWriteFailures -Expected 0
+
+Write-Host "━━━ RWS run: relay returns although a descendant holds the pipes ━━━" -ForegroundColor Cyan
+
+# Regression guard for "the run finished but the shell never came back":
+# a child's stdout/stderr are anonymous pipes, and a grandchild inherits them
+# through CreateProcess.  When the grandchild outlives the child (the JVM,
+# headless Chrome, an agent CLI), the pipes stay open, so
+# Process.WaitForExit() (parameterless) — which also waits for the async
+# readers to reach EOF — blocked the caller for as long as that grandchild
+# lived.  Ctrl+C cannot break a thread parked in that native wait, so a
+# finished 5-hour run had to be killed from outside.  The drain is bounded now:
+# this call must come back within -DrainTimeoutSec, long before the holder
+# exits on its own.
+$grandchildSeconds = 15
+$pipeHolderChild = Join-Path $relayDir 'spawns-pipe-holding-grandchild.ps1'
+@"
+Write-Output 'holder-child-line-one'
+`$exe = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+`$null = Start-Process -FilePath `$exe -ArgumentList @('-NoProfile', '-Command', 'Start-Sleep -Seconds $grandchildSeconds') -NoNewWindow -PassThru
+Write-Output 'holder-child-line-two'
+"@ | Set-Content -LiteralPath $pipeHolderChild -Encoding utf8
+
+$pipeHolderLog = Join-Path $relayDir 'pipe-holder.log'
+$pipeHolderWatch = [Diagnostics.Stopwatch]::StartNew()
+$pipeHolderOutput = & {
+    Invoke-ChildProcessStreaming -FilePath $pwshExe `
+        -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $pipeHolderChild) `
+        -LogFile $pipeHolderLog -HeartbeatSeconds 0 -DrainTimeoutSec 3
+} 6>&1
+$pipeHolderWatch.Stop()
+
+$pipeHolderResult = @($pipeHolderOutput | Where-Object { $_ -is [hashtable] })[0]
+$pipeHolderText = ($pipeHolderOutput | ForEach-Object { "$_" }) -join "`n"
+
+Assert-NotNull -Label 'Relay with pipe-holding grandchild: returns a result' -Value $pipeHolderResult
+Assert-Returns -Label 'Relay with pipe-holding grandchild: child exit code' -Actual $pipeHolderResult.ExitCode -Expected 0
+Assert-Returns -Label 'Relay with pipe-holding grandchild: both child lines captured' -Actual $pipeHolderResult.OutputLines -Expected 2
+Assert-ContainsString -Label 'Relay with pipe-holding grandchild: warns about the held pipes' -Haystack $pipeHolderText -Needle 'still held open'
+# Bounded drain is 3s; the unbounded call would sit here for $grandchildSeconds.
+Assert-Returns -Label 'Relay with pipe-holding grandchild: returns in bounded time' `
+    -Actual ($pipeHolderWatch.Elapsed.TotalSeconds -lt 12) -Expected $true
+
+if ($IsWindows -or $env:OS -eq 'Windows_NT') {
+    Assert-ContainsString -Label 'Relay with pipe-holding grandchild: names the surviving descendant' `
+        -Haystack $pipeHolderText -Needle 'descendant process(es)'
+} else {
+    Write-Host '    (skipped survivor listing assertion — Win32_Process is Windows-only)' -ForegroundColor DarkGray
+}
+
+# The bounded drain plus the EOF counter are what make the return possible;
+# pin them so a future "simplify back to WaitForExit()" cannot slip through.
+$runnerSource = Get-Content -LiteralPath $TestPs1Path -Raw
+Assert-ContainsString -Label 'Relay: runner drains with Wait-ChildOutputDrain' `
+    -Haystack $runnerSource -Needle 'Wait-ChildOutputDrain -Relay $relay'
+Assert-ContainsString -Label 'Relay: relay tracks stream EOF' -Haystack $runnerSource -Needle 'EofCount'
 
 Remove-Item -LiteralPath $relayDir -Recurse -Force -ErrorAction SilentlyContinue
 

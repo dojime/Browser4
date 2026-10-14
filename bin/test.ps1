@@ -2310,7 +2310,10 @@ Return ONLY the refined Markdown. Do not include any preamble, commentary, or co
 #   * keeps the last lines in a ring buffer and prints a heartbeat with the
 #     elapsed time while the child is silent,
 #   * warns loudly when a child produced no output at all instead of printing
-#     an empty "child output" section.
+#     an empty "child output" section,
+#   * returns to the caller as soon as the child exited: the final drain of the
+#     output pipes is bounded (Wait-ChildOutputDrain), because descendants that
+#     inherited those pipes (JVM, headless Chrome) can hold them open forever.
 #
 # Why not `Start-Process -RedirectStandardOutput <tempfile>` + polling?
 #   That relay depends on PowerShell's own stdout pump copying the child's
@@ -2392,6 +2395,9 @@ public sealed class B4ChildOutputRelay
     private long _lines;
     private long _stderrLines;
     private long _chars;
+    private int _eofCount;
+    private long _consoleFailures;
+    private string _lastConsoleError = string.Empty;
     private DateTime _lastOutputUtc = DateTime.UtcNow;
     private string _lastLine = string.Empty;
 
@@ -2402,23 +2408,40 @@ public sealed class B4ChildOutputRelay
         _tail = new string[tailSize];
     }
 
+    // A null DataReceivedEventArgs means the stream reached EOF.  EOF is the
+    // only thing that tells the caller the child *and every process that
+    // inherited its stdout/stderr* are done with the pipe, so it is counted
+    // instead of being thrown away.
     public void OnStdout(object sender, DataReceivedEventArgs e)
     {
-        Emit(e == null ? null : e.Data, false);
+        if (e == null || e.Data == null) { lock (_sync) { _eofCount++; } return; }
+        Emit(e.Data, false);
     }
 
     public void OnStderr(object sender, DataReceivedEventArgs e)
     {
-        Emit(e == null ? null : e.Data, true);
+        if (e == null || e.Data == null) { lock (_sync) { _eofCount++; } return; }
+        Emit(e.Data, true);
     }
 
     private void Emit(string line, bool isStdErr)
     {
         if (line == null) { return; }
 
-        // Console first: the caller must see output as it arrives.
-        if (isStdErr) { Console.Error.WriteLine(line); }
-        else { Console.Out.WriteLine(line); }
+        // Console first: the caller must see output as it arrives.  A closed or
+        // broken console pipe (a run piped into `head -50`, a lost terminal)
+        // must never take this reader thread down: a dead reader stops
+        // delivering EOF, which is what parked the runner in its drain.  Fail
+        // loudly later instead of hanging (or crashing) now.
+        try
+        {
+            if (isStdErr) { Console.Error.WriteLine(line); }
+            else { Console.Out.WriteLine(line); }
+        }
+        catch (Exception ex)
+        {
+            lock (_sync) { _consoleFailures++; _lastConsoleError = ex.Message; }
+        }
 
         lock (_sync)
         {
@@ -2443,6 +2466,15 @@ public sealed class B4ChildOutputRelay
     public long StderrLines { get { lock (_sync) { return _stderrLines; } } }
     public long Chars { get { lock (_sync) { return _chars; } } }
     public string LastLine { get { lock (_sync) { return _lastLine; } } }
+
+    /// <summary>Number of streams that have reached EOF (0, 1 or 2).</summary>
+    public int EofCount { get { lock (_sync) { return _eofCount; } } }
+
+    /// <summary>Lines that could not be echoed to the console (broken stdout/stderr).</summary>
+    public long ConsoleWriteFailures { get { lock (_sync) { return _consoleFailures; } } }
+
+    /// <summary>Message of the last failed console write, for the caller's report.</summary>
+    public string LastConsoleError { get { lock (_sync) { return _lastConsoleError; } } }
 
     public double SecondsSinceLastOutput
     {
@@ -2526,6 +2558,114 @@ function Write-ChildHeartbeat {
     }
 }
 
+function Wait-ChildOutputDrain {
+    <#
+    .SYNOPSIS
+        Wait for the child's output pipes to reach EOF, but never forever.
+
+    .DESCRIPTION
+        A child's stdout/stderr are anonymous pipes; EOF happens only when
+        *every* write end is closed.  Grandchildren inherit those handles and
+        routinely outlive the child (the Browser4 / mock-site JVM, headless
+        Chrome, an agent CLI), so an unbounded wait for EOF parks the caller
+        for as long as any of them lives — and a thread blocked in that native
+        wait ignores Ctrl+C.
+
+        This helper returns as soon as both streams reported EOF or the
+        deadline expires, whichever comes first.  The caller can then continue
+        with the output it already has instead of hanging.
+
+    .PARAMETER Relay
+        The B4ChildOutputRelay instance collecting the child's output.
+
+    .PARAMETER TimeoutSec
+        Maximum seconds to wait for EOF.  0 returns immediately.
+
+    .OUTPUTS
+        Boolean — $true when the deadline expired before both streams hit EOF.
+    #>
+    param(
+        [Parameter(Mandatory = $true)] $Relay,
+        [double] $TimeoutSec = 10
+    )
+
+    if ($TimeoutSec -le 0) {
+        return ($Relay.EofCount -lt 2)
+    }
+
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSec)
+    while ($Relay.EofCount -lt 2 -and [DateTime]::UtcNow -lt $deadline) {
+        Start-Sleep -Milliseconds 50
+    }
+
+    return ($Relay.EofCount -lt 2)
+}
+
+function Get-DescendantProcessSnapshot {
+    <#
+    .SYNOPSIS
+        Describe the still-running descendants of a (now exited) child process.
+
+    .DESCRIPTION
+        The processes that can keep a child's stdout/stderr pipes open are
+        exactly the child's surviving descendants: they inherited the write
+        ends through CreateProcess.  Naming them turns "the runner hung" into
+        an actionable message ("headless Chrome PID 1234 is still attached to
+        the run"), which is why the streaming runner lists them when the output
+        drain times out.
+
+        Windows-only: it uses Win32_Process.  Other platforms simply get an
+        empty list — pipe inheritance does not outlive the child there.
+
+    .PARAMETER RootPid
+        Process id of the child that already exited.
+
+    .OUTPUTS
+        Array of PSCustomObject (Id, Name, Started).  Empty when unavailable.
+    #>
+    param([int] $RootPid)
+
+    if (-not ($IsWindows -or $env:OS -eq 'Windows_NT')) { return @() }
+    if ($RootPid -le 0) { return @() }
+
+    try {
+        $all = @(Get-CimInstance Win32_Process -ErrorAction Stop)
+    } catch {
+        return @()
+    }
+    if ($all.Count -eq 0) { return @() }
+
+    $byParent = @{}
+    foreach ($p in $all) {
+        $key = [int]$p.ParentProcessId
+        if (-not $byParent.ContainsKey($key)) { $byParent[$key] = [System.Collections.Generic.List[object]]::new() }
+        $byParent[$key].Add($p)
+    }
+
+    $found = [System.Collections.Generic.List[object]]::new()
+    $queue = [System.Collections.Generic.Queue[int]]::new()
+    $visited = @{}
+    $queue.Enqueue($RootPid)
+
+    while ($queue.Count -gt 0) {
+        $current = $queue.Dequeue()
+        if ($visited.ContainsKey($current)) { continue }
+        $visited[$current] = $true
+        if (-not $byParent.ContainsKey($current)) { continue }
+        foreach ($child in $byParent[$current]) {
+            $childPid = [int]$child.ProcessId
+            $found.Add([pscustomobject]@{
+                Id      = $childPid
+                Name    = $child.Name
+                Started = $child.CreationDate
+            })
+            $queue.Enqueue($childPid)
+        }
+    }
+
+    return $found.ToArray()
+}
+
 function Invoke-ChildProcessStreaming {
     <#
     .SYNOPSIS
@@ -2546,6 +2686,11 @@ function Invoke-ChildProcessStreaming {
         produces no output can never leave the caller staring at an empty
         section: the heartbeat keeps running and the caller warns afterwards.
 
+        The child's exit is what ends the call: the trailing drain of the output
+        pipes uses Wait-ChildOutputDrain, so a descendant that inherited them
+        (JVM, headless Chrome) delays the return by at most -DrainTimeoutSec
+        instead of blocking it forever.
+
     .PARAMETER FilePath
         Executable to run (see Get-PwshExecutable).
 
@@ -2563,16 +2708,24 @@ function Invoke-ChildProcessStreaming {
         Base heartbeat interval (progressive backoff is applied).  0 disables
         heartbeats.
 
+    .PARAMETER DrainTimeoutSec
+        Maximum seconds to wait for the child's stdout/stderr pipes to reach
+        EOF after the child exited.  Descendants that inherited those pipes
+        (JVM, headless Chrome) can keep them open long after the child is gone;
+        the wait is therefore bounded so the caller always gets control back.
+        See Wait-ChildOutputDrain.
+
     .OUTPUTS
         Hashtable with ExitCode, DurationSec, LogFile, OutputLines,
-        StderrLines, OutputChars and ChildPid.
+        StderrLines, OutputChars, ConsoleWriteFailures and ChildPid.
     #>
     param(
         [Parameter(Mandatory = $true)] [string] $FilePath,
         [string[]] $ArgumentList = @(),
         [string] $WorkingDirectory = '',
         [string] $LogFile = '',
-        [int] $HeartbeatSeconds = 20
+        [int] $HeartbeatSeconds = 20,
+        [double] $DrainTimeoutSec = 10
     )
 
     $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
@@ -2654,9 +2807,52 @@ function Invoke-ChildProcessStreaming {
                 }
             }
 
-            # The parameterless overload also waits for the async readers to
-            # drain, so no output is lost between exit and this return.
-            $proc.WaitForExit()
+            # ── Drain the async readers, but not forever -------------------
+            # Process.WaitForExit() (parameterless) also waits for the async
+            # readers to reach EOF, and EOF requires *every* write end of the
+            # stdout/stderr pipes to be closed.  Grandchildren inherit those
+            # write ends and outlive the child by design — the Browser4 /
+            # mock-site JVM, headless Chrome, an agent CLI — so the
+            # parameterless overload parked this runner for as long as any of
+            # them lived.  Ctrl+C cannot break a thread blocked in that native
+            # wait, which is why a finished run could not be interrupted.
+            # Waiting with a deadline keeps the "no output is lost between exit
+            # and return" guarantee for every normal run and still returns when
+            # a leftover descendant holds the pipes open.
+            $drainTimedOut = Wait-ChildOutputDrain -Relay $relay -TimeoutSec $DrainTimeoutSec
+            if ($drainTimedOut) {
+                # Stop the readers so no late line from a leftover descendant
+                # can interleave with the caller's own output.
+                try { $proc.CancelOutputRead() } catch { }
+                try { $proc.CancelErrorRead() } catch { }
+
+                Write-Host "  Note: the child (PID $childPid) exited, but its output pipes are still held open after ${DrainTimeoutSec}s." -ForegroundColor DarkYellow
+                $survivors = @(Get-DescendantProcessSnapshot -RootPid $childPid)
+                if ($survivors.Count -gt 0) {
+                    Write-Host "  $($survivors.Count) descendant process(es) inherited the child's stdout/stderr and are still alive:" -ForegroundColor DarkYellow
+                    foreach ($survivor in ($survivors | Select-Object -First 8)) {
+                        Write-Host "    - $($survivor.Name) (PID $($survivor.Id), started $($survivor.Started))" -ForegroundColor DarkGray
+                    }
+                    if ($survivors.Count -gt 8) {
+                        Write-Host "    ... and $($survivors.Count - 8) more" -ForegroundColor DarkGray
+                    }
+                }
+                Write-Host '  Continuing without them — they no longer block this run.' -ForegroundColor DarkGray
+            } else {
+                # EOF on both streams: the parameterless overload would return
+                # immediately now, so nothing is left to wait for.
+                $proc.WaitForExit()
+            }
+
+            # A console that refused the child's output (piped into `head -50`,
+            # terminal gone) is reported here instead of vanishing silently —
+            # the run log still holds every line.
+            $consoleFailures = if ($relay) { $relay.ConsoleWriteFailures } else { 0 }
+            if ($consoleFailures -gt 0) {
+                try {
+                    Write-Host "  Note: $consoleFailures line(s) could not be echoed to the console ($($relay.LastConsoleError)) — the log has them." -ForegroundColor DarkYellow
+                } catch { }
+            }
         } else {
             # ── Fallback: inherited stdio (no capture, no log) -------------
             # Still better than capturing into a file nothing ever reads.
@@ -2683,6 +2879,8 @@ function Invoke-ChildProcessStreaming {
                     Write-Host "  · child (PID $childPid) still running — ${minutes}m ${seconds}s elapsed" -ForegroundColor DarkGray
                 }
             }
+            # No redirected streams in this path, so the parameterless
+            # WaitForExit() cannot wait for a pipe: it returns with the child.
             $proc.WaitForExit()
         }
     } finally {
@@ -2702,6 +2900,7 @@ function Invoke-ChildProcessStreaming {
         OutputLines = if ($relay) { $relay.Lines } else { 0 }
         StderrLines = if ($relay) { $relay.StderrLines } else { 0 }
         OutputChars = if ($relay) { $relay.Chars } else { 0 }
+        ConsoleWriteFailures = if ($relay) { $relay.ConsoleWriteFailures } else { 0 }
         ChildPid    = $childPid
     }
 
