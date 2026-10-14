@@ -382,6 +382,8 @@ function Print-Usage {
     Write-Host "  test.ps1 mcp-contract               # Contract gate: matrix + docs + lint + validators"
     Write-Host "  test.ps1 ps                         # PowerShell tests + the skills/ conformance lint CI runs next"
     Write-Host "  test.ps1 ps -Quiet                  # Run PowerShell tests with -Quiet flag"
+    Write-Host "  test.ps1 -Show ps                   # List the discovered PowerShell test files"
+    Write-Host "                                      # (any other ps argument is rejected, not ignored)"
     Write-Host "  test.ps1 resume                     # Resume from the last failed module"
     Write-Host "  test.ps1 rws                        # Show RWS help"
     Write-Host "  test.ps1 rws sc amazon              # Run a specific scenario task"
@@ -3605,7 +3607,7 @@ function Invoke-SkillDocConformance {
     return [int]$LASTEXITCODE
 }
 
-function Invoke-PowerShellTests([string[]]$additionalArgs) {
+function Invoke-PowerShellTests([string[]]$additionalArgs, [switch]$StrictArgs) {
     <#
     .SYNOPSIS
         Discover and run all *.tests.ps1 files in the repository.
@@ -3616,8 +3618,36 @@ function Invoke-PowerShellTests([string[]]$additionalArgs) {
         executed with `pwsh -NoProfile -ExecutionPolicy Bypass -File`.
 
         In DryRun/Show mode, lists the discovered files without executing.
-        Additional arguments are forwarded to every test script (e.g. -Quiet).
+        -Quiet is the one argument this target understands: it is forwarded to
+        every plain test script and switches the Pester path to `-Show None`.
+
+        Any other argument is rejected when `ps` is the only selected target.
+        One that nothing consumes used to be forwarded and silently dropped, so
+        `test.ps1 ps --list` ran the whole suite — long enough to look like a
+        hang — instead of listing anything.
+
+    .PARAMETER additionalArgs
+        Arguments to forward.  See the note above for what is accepted.
+
+    .PARAMETER StrictArgs
+        Reject arguments this target does not know.  The dispatcher sets it when
+        `ps` is the only selected target; in a combined run (e.g.
+        `test.ps1 ps fast -pl browser4-core`) the same tokens legitimately
+        belong to the other suites.
     #>
+    if ($StrictArgs) {
+        $knownArgs = @('-Quiet')
+        $unknownArgs = @($additionalArgs | Where-Object { $_ -and ($knownArgs -notcontains $_) })
+        if ($unknownArgs.Count -gt 0) {
+            Write-Host "ERROR: unrecognized argument(s) for 'ps': $($unknownArgs -join ' ')" -ForegroundColor Red
+            Write-Host '  ps runs every *.tests.ps1 in the repository (Pester or pwsh -File).' -ForegroundColor DarkGray
+            Write-Host "  Known arguments: $($knownArgs -join ', ')  (forwarded to the test scripts)" -ForegroundColor DarkGray
+            Write-Host '  To list the files instead of running them:  test.ps1 -Show ps' -ForegroundColor DarkGray
+            Write-Host '  The scenario runner keeps its own flags:    test.ps1 rws sc --list' -ForegroundColor DarkGray
+            exit 1
+        }
+    }
+
     Write-CommandBanner -Label 'Discovering PowerShell tests...'
 
     $testFiles = @(Get-ChildItem -Path $repoRoot -Recurse -Filter '*.tests.ps1' -File |
@@ -4523,7 +4553,12 @@ if ($rwsTests.Count -gt 0) {
 }
 
 if ($psTests.Count -gt 0) {
-    Invoke-PowerShellTests -additionalArgs $additionalArgs
+    # Strict only when nothing else can consume the arguments: `ps` is then the
+    # sole owner of the command line, so an unknown flag is a user error rather
+    # than a pass-through meant for another suite.
+    $psIsSoleTarget = ($mavenTests.Count -eq 0 -and $cliTests.Count -eq 0 -and
+                       $rwsTests.Count -eq 0 -and $launchTargets.Count -eq 0)
+    Invoke-PowerShellTests -additionalArgs $additionalArgs -StrictArgs:$psIsSoleTarget
 }
 
 if ($launchTargets.Count -gt 0) {

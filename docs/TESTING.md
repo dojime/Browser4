@@ -212,6 +212,10 @@ pwsh bin/skill-doc-lint.ps1   # 只跑合规检查（与 CI 那一步等价的�
 * `pr.yml` / `ci.yml` 仍各自显式跑 `./bin/skill-doc-lint.ps1`（步骤名
   `Skill document conformance (methodology M1-M8)`）；本地挂载不改变 CI 的判定。
 * 挂载本身的回归保护在 `bin/tests/test.ps1.tests.ps1`（退出码契约 + 三个组的 `-Show` 可达性）。
+* `ps` 只认 `-Quiet`（转发给每个测试脚本，Pester 分支转成 `-Show None`）；**其余参数一律报错**
+  （仅当 `ps` 是唯一目标时；`ps fast -pl x` 这类组合仍按原样透传）。此前未识别的参数会被静静转发、
+  再被测试脚本丢弃，所以 `ps --list` 不是列文件而是把整套测试跑了一遍——长到看起来像卡死。
+  要列文件用 `pwsh bin/test.ps1 -Show ps`。
 
 ---
 

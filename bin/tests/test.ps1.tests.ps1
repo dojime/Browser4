@@ -106,6 +106,25 @@ function Assert-ContainsString {
     }
 }
 
+function Assert-NotContainsString {
+    param(
+        [string]$Label,
+        [string]$Haystack,
+        [string]$Needle
+    )
+    $passed = $Haystack -notmatch [regex]::Escape($Needle)
+    if ($passed) {
+        Write-Host "    ✅ $Label" -ForegroundColor Green
+    } else {
+        Write-Host "    ❌ $Label — string unexpectedly contains '$Needle'" -ForegroundColor Red
+        $script:ContentFailures++
+    }
+    $exitCode = if ($passed) { 0 } else { 1 }
+    if (Get-Command Register-CliResult -ErrorAction SilentlyContinue) {
+        Register-CliResult -Label $Label -ExitCode $exitCode -Elapsed ([TimeSpan]::Zero)
+    }
+}
+
 function Assert-NotNull {
     param(
         [string]$Label,
@@ -1053,6 +1072,24 @@ Assert-ContainsString -Label 'Wiring: skills -Show runs the conformance check' -
 
 $contractShow = pwsh -NoProfile -Command "& '$testPs1Abs' -NoSession -Show mcp-contract *>&1" *>&1 | Out-String
 Assert-ContainsString -Label 'Wiring: mcp-contract -Show runs the conformance check' -Haystack $contractShow -Needle 'skill-doc-lint.ps1'
+
+Write-Host "━━━ ps: unknown arguments are rejected, not silently ignored ━━━" -ForegroundColor Cyan
+
+# `ps --list` used to be forwarded to every test script and dropped there, so
+# the whole suite ran (long enough to look like a hang) instead of listing.
+$psUnknown = pwsh -NoProfile -Command "& '$testPs1Abs' -NoSession ps --list *>&1; `$LASTEXITCODE" *>&1 | Out-String
+Assert-ContainsString -Label 'ps --list: reports the unrecognized argument' -Haystack $psUnknown -Needle "unrecognized argument(s) for 'ps': --list"
+Assert-ContainsString -Label 'ps --list: points at -Show ps' -Haystack $psUnknown -Needle 'test.ps1 -Show ps'
+Assert-ContainsString -Label 'ps --list: names the known argument set' -Haystack $psUnknown -Needle 'Known arguments: -Quiet'
+
+# The one accepted argument must keep working, including with -Show.
+$psQuietShow = pwsh -NoProfile -Command "& '$testPs1Abs' -NoSession -Show ps -Quiet *>&1" *>&1 | Out-String
+Assert-ContainsString -Label 'ps -Quiet: still listed under -Show' -Haystack $psQuietShow -Needle 'Found '
+
+# A combined run keeps the old pass-through behaviour: the flag belongs to the
+# other suite, so `ps` must not reject it.
+$psCombined = pwsh -NoProfile -Command "& '$testPs1Abs' -NoSession -Show ps fast -pl nowhere *>&1" *>&1 | Out-String
+Assert-NotContainsString -Label 'ps + fast -pl: not rejected when ps is not the sole target' -Haystack $psCombined -Needle 'unrecognized argument(s)'
 
 # ═══════════════════════════════════════════════════════════════════
 # Summary
