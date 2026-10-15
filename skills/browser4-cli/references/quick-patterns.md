@@ -38,7 +38,7 @@ Named sessions isolate browser state. Create and switch with `-s <name>`, list w
 ```bash
 browser4-cli -s research goto "https://en.wikipedia.org"   # opens "research"
 browser4-cli -s news     goto "https://news.ycombinator.com" # opens "news"
-browser4-cli -s news     snapshot -i --stdout              # act inside "news"
+browser4-cli -s news     snapshot -v 0 --stdout            # act inside "news"
 browser4-cli list                                          # show all sessions
 browser4-cli list --all                                    # + sessions from other checkouts (Workspace column)
 browser4-cli -s news     close                             # close only "news"
@@ -99,6 +99,23 @@ browser4-cli hover <ref>
 browser4-cli eval "getComputedStyle(document.querySelector('.tooltip')).visibility"  # "visible"
 browser4-cli eval "document.querySelector('.card-detail').clientHeight"              # grew past 0
 ```
+
+**Getting refs for draggable/hover targets:** `snapshot -i` is a strict interactive-only filter —
+inner text is merged into the names of the elements that survive: buttons, links, inputs and
+pointer (`cursor:pointer`) elements keep refs, but draggable items (`li[draggable=true]`,
+`cursor:grab`) and hover-only targets (tooltip spans) lose theirs, and `-v` drops them from the
+output entirely. For those targets, snapshot the plain way, act from those refs, then re-snapshot:
+
+```bash
+browser4-cli snapshot -v 0                    # refs for all on-screen elements, draggable included
+browser4-cli drag <source-ref> <target-ref>   # act using those refs
+browser4-cli snapshot -v 0                    # re-snapshot: refs are invalidated by the interaction
+```
+
+> **Note:** `-i -v <n>` returns only interactive elements in that one viewport chunk — a focused
+> interactive screenful, not a filtered full tree. Extending the interactive heuristic to
+> draggable/hover-revealed elements is expected, so those refs stop silently disappearing; until
+> then, do not use `-i` as the only orientation view before acting.
 
 ### 5. Dialog Handling
 
@@ -233,7 +250,7 @@ See **[agent.md](agent.md)** for full details including LLM key configuration, e
 | `-s <name>` | session commands | Target a named session |
 | `--stdout` | `snapshot` | Print to stdout instead of a file |
 | `--auto-diff` | `snapshot` | Diff vs the previous snapshot — shows only what changed |
-| `-i`, `--interactive` | `snapshot` | Interactive-oriented rendering: inner text merged into element names so ref lines are self-contained targets (not a strict interactive-only filter — pair with `-v 0` to bound size) |
+| `-i`, `--interactive` | `snapshot` | Interactive-only rendering (strict filter); see Pattern 4 |
 | `--all` | `htmlsnapshot get` | Return all matches (JSON array) |
 | `--sql @file` | `htmlsnapshot query` | Read the X-SQL query from a file (avoids shell quoting) |
 | `--wait`, `--wait-timeout <s>` | `agent run` | Block for the result (default 600 s) |

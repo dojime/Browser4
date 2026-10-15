@@ -210,6 +210,7 @@ struct FixtureServer {
 struct FixturePages {
     interactive_html: String,
     other_html: String,
+    emulation_html: String,
     form_html: String,
     mouse_html: String,
     keyboard_html: String,
@@ -262,6 +263,7 @@ impl FixtureServer {
         let pages = Arc::new(FixturePages {
             interactive_html: load_html_fixture(INTERACTIVE_FIXTURE_FILE),
             other_html: load_html_fixture(OTHER_FIXTURE_FILE),
+            emulation_html: load_html_fixture(EMULATION_FIXTURE_FILE),
             form_html: load_html_fixture(FORM_FIXTURE_FILE),
             mouse_html: load_html_fixture(MOUSE_FIXTURE_FILE),
             keyboard_html: load_html_fixture(KEYBOARD_FIXTURE_FILE),
@@ -492,6 +494,12 @@ fn serve_fixture_request(mut stream: std::net::TcpStream, pages: Arc<FixturePage
             "200 OK",
             "text/html; charset=utf-8",
             pages.console_probe_html.clone(),
+        )
+    } else if path == EMULATION_PATH {
+        (
+            "200 OK",
+            "text/html; charset=utf-8",
+            pages.emulation_html.clone(),
         )
     } else if path.split('?').next() == Some(EXPERIENCE_PATH) {
         // The experience-replay fixture derives its expected query from
@@ -2601,6 +2609,11 @@ impl E2ECtx {
     /// The console serialization probe page (see `console-probe-fixture.html`).
     fn console_probe_url(&self) -> String {
         format!("{}{}", self.fixture_base_url, CONSOLE_PROBE_PATH)
+    }
+
+    /// The device-metrics probe page (see `emulation-fixture.html`).
+    fn emulation_url(&self) -> String {
+        format!("{}{}", self.fixture_base_url, EMULATION_PATH)
     }
 
     /// The experience-replay fixture.  `nonce` makes the query this page expects
@@ -5175,6 +5188,7 @@ fn tested_commands(include_batch_command: bool) -> HashSet<&'static str> {
         "network-request",
         "network-route",
         "network-unroute",
+        "network-routes",
         "har-start",
         "har-stop",
         // test_tool_call_command

@@ -808,6 +808,11 @@ Browser4 includes a lightweight **MockSite** server that serves static HTML page
 **Windows (pwsh — PowerShell 7+):** `./bin/test.ps1 mock-site -Dmock.site.port=18080`
 **Linux/macOS:** `./bin/test.sh mock-site -Dmock.site.port=18080`
 
+> **First run on a cold Maven cache takes 10–15 minutes** (observed ~13 min) and prints nothing
+> while it installs `browser4-dependencies`, then `browser4-rest` and its ~25 modules — the first
+> `[PASS]` banner only appears after each phase finishes. Once the artifacts are cached, startup is
+> fast. Don't kill the process and start a second concurrent Maven build.
+
 Key demo pages are served at `http://localhost:18080/generated/`. For the full page listing, environment variables, Python fallback, and Maven-based launch, see [MockSite](docs/mocksite.md). For the test taxonomy and tagging system, see [Test Taxonomy](docs/TESTING.md).
 
 ---

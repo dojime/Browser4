@@ -1134,6 +1134,46 @@ class CrawlSupportTest {
     }
 
     // ------------------------------------------------------------------
+    // buildHttpErrorNote
+    // ------------------------------------------------------------------
+
+    @Test
+    @DisplayName("a crawl whose pages were all served successfully has no HTTP error note")
+    fun testNoHttpErrorsProduceNoNote() {
+        val pages = listOf(
+            CrawlPageResult(url = "https://example.com/1.html", httpStatus = 200),
+            CrawlPageResult(url = "https://example.com/2.html", httpStatus = 304)
+        )
+
+        assertNull(buildHttpErrorNote(pages))
+    }
+
+    @Test
+    @DisplayName("an HTTP error page is reported instead of counting as a successful page")
+    fun testHttpErrorPagesAreReported() {
+        val pages = listOf(
+            CrawlPageResult(url = "https://example.com/ok.html", httpStatus = 200),
+            CrawlPageResult(url = "https://example.com/missing.html", httpStatus = 404)
+        )
+
+        val note = requireNotNull(buildHttpErrorNote(pages))
+
+        assertTrue(note.contains("1 of 2 page(s) were served with an HTTP error status"), note)
+        assertTrue(note.contains("404: 1"), note)
+        assertTrue(note.contains("https://example.com/missing.html (404)"), note)
+    }
+
+    @Test
+    @DisplayName("a store-served row is not an HTTP error even when its status looks like one")
+    fun testStoreServedRowsAreExempt() {
+        val pages = listOf(
+            CrawlPageResult(url = "https://example.com/old.html", httpStatus = 404, servedFromStore = true)
+        )
+
+        assertNull(buildHttpErrorNote(pages))
+    }
+
+    // ------------------------------------------------------------------
     // buildLossNote
     // ------------------------------------------------------------------
 

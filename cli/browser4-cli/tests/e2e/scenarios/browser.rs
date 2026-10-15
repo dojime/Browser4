@@ -1010,18 +1010,20 @@ pub(super) fn test_eval_return_types(ctx: &mut E2ECtx) {
     );
 
     // --- undefined ---
-    // `void 0` evaluates to undefined in JS. Some servers serialize
-    // undefined as the empty string, others as "undefined".  The CLI
-    // wraps genuinely empty eval results in quotes to make them visible
-    // on stdout, so accept "undefined", the quoted empty string ("\"\""),
-    // or a genuinely empty trimmed result.
-    // The CLI may append a diagnostic tip on the next line when the result
-    // is empty — only check the first line.
+    // `void 0` evaluates to undefined, and in the default main world the backend
+    // carries it as JSON null, so the CLI prints `null` — the same rendering as JS
+    // `null` (they are indistinguishable in plain output; see references/eval.md).
+    // An isolated-world evaluation arrived as an empty string instead, and the CLI
+    // quotes a genuinely empty result, so accept those spellings too.
+    // The CLI may append a diagnostic tip on the next line — only check the first.
     let undef_val = eval_text(ctx, "void 0");
     let first_line = undef_val.lines().next().unwrap_or("").trim();
     assert!(
-        first_line == "undefined" || first_line.is_empty() || first_line == "\"\"",
-        "Expected undefined, empty string, or quoted-empty for `void 0`, got: {undef_val}"
+        first_line == "null"
+            || first_line == "undefined"
+            || first_line.is_empty()
+            || first_line == "\"\"",
+        "Expected null, undefined, empty string, or quoted-empty for `void 0`, got: {undef_val}"
     );
 
     run_command(ctx, &["close"]);
@@ -1673,23 +1675,43 @@ pub(super) fn test_tab_commands(ctx: &mut E2ECtx) {
 /// output or [deadline] passes, panicking with the last output on timeout.
 /// Polling replaces fixed sleeps: loaded CI machines get more time, fast ones
 /// less.
+/// Tracked requests from `network requests --json`.
+///
+/// `--json` is the CLI's single JSON envelope (SKILL.md), and the buffer travels in
+/// `output.result` as native JSON, so this is one parse rather than a second one over
+/// a stringified payload.  The command's default output is the compact table.
+fn network_request_entries(ctx: &mut E2ECtx) -> Vec<serde_json::Value> {
+    let output = run_command(ctx, &["network", "requests", "--json"]).stdout;
+    let envelope = parse_json_output(&output, "network requests --json");
+    match envelope.pointer("/output/result") {
+        Some(serde_json::Value::Array(entries)) => entries.clone(),
+        // Nothing tracked yet arrives as an empty string; keep polling on it.
+        Some(serde_json::Value::String(text)) if text.trim().is_empty() => Vec::new(),
+        Some(serde_json::Value::Null) => Vec::new(),
+        other => panic!("expected output.result[] in the envelope, got {other:?} in:\n{output}"),
+    }
+}
+
+/// Poll [network_request_entries] until every [expected] substring appears in the
+/// serialized entries, or [deadline] passes.
 fn poll_network_requests_until(
     ctx: &mut E2ECtx,
     expected: &[&str],
     deadline: Instant,
     context: &str,
-) -> String {
-    let mut last = String::new();
+) -> Vec<serde_json::Value> {
+    let mut last: Vec<serde_json::Value> = Vec::new();
     while Instant::now() < deadline {
-        let check = run_command(ctx, &["network", "requests"]);
-        last = check.stdout.clone();
-        if expected.iter().all(|needle| last.contains(needle)) {
+        last = network_request_entries(ctx);
+        let text = serde_json::Value::Array(last.clone()).to_string();
+        if expected.iter().all(|needle| text.contains(needle)) {
             return last;
         }
         thread::sleep(Duration::from_millis(300));
     }
     panic!(
-        "timed out waiting for {expected:?} in network requests ({context}); last output:\n{last}"
+        "timed out waiting for {expected:?} in network requests ({context}); last entries:\n{}",
+        serde_json::Value::Array(last)
     );
 }
 
@@ -1760,8 +1782,9 @@ pub(super) fn test_network_requests_and_har(ctx: &mut E2ECtx) {
     // fetches are observed.
     let first_list = run_command(ctx, &["network", "requests"]);
     assert!(
-        first_list.stdout.contains("["),
-        "network requests should print a JSON array, got:\n{}",
+        first_list.stdout.contains("Network requests:")
+            || first_list.stdout.contains("No network requests tracked yet"),
+        "the first read should report the tracked buffer (empty or not), got:\n{}",
         first_list.stdout
     );
 
@@ -1776,21 +1799,44 @@ pub(super) fn test_network_requests_and_har(ctx: &mut E2ECtx) {
     // 3. Both fetches are now tracked — poll instead of a fixed sleep so the
     // assertion is robust under load.
     let deadline = Instant::now() + Duration::from_secs(15);
-    let list_output = poll_network_requests_until(
+    let entries = poll_network_requests_until(
         ctx,
         &["network-endpoint-ok", "network-endpoint-missing"],
         deadline,
         "after goto to /network",
     );
+    let listed = serde_json::Value::Array(entries.clone()).to_string();
     assert!(
-        list_output.contains("network-endpoint-ok"),
-        "expected the 200 fetch in tracked requests, got:\n{}",
-        list_output
+        listed.contains("network-endpoint-ok"),
+        "expected the 200 fetch in tracked requests, got:\n{listed}"
     );
     assert!(
-        list_output.contains("network-endpoint-missing"),
-        "expected the 404 fetch in tracked requests, got:\n{}",
-        list_output
+        listed.contains("network-endpoint-missing"),
+        "expected the 404 fetch in tracked requests, got:\n{listed}"
+    );
+
+    // The default output is the documented compact table; `--json` (used by the poll
+    // above) is the machine mode. Assert the table shape too, so the renderer has
+    // coverage and a regression back to JSON-by-default cannot hide here.
+    let table = run_command(ctx, &["network", "requests"]);
+    assert!(
+        table.stdout.contains("Network requests:")
+            && table.stdout.contains("Full headers and bodies:"),
+        "network requests should print the compact table by default, got:\n{}",
+        table.stdout
+    );
+    assert!(
+        table.stdout.contains("network-endpoint-ok")
+            && table.stdout.contains("network-endpoint-missing"),
+        "the table should list both tracked fetches, got:\n{}",
+        table.stdout
+    );
+
+    let limited = run_command(ctx, &["network", "requests", "--limit", "1"]);
+    assert!(
+        limited.stdout.contains("showing the newest 1"),
+        "--limit 1 should report the window it printed, got:\n{}",
+        limited.stdout
     );
 
     // 4. Filters.
@@ -1813,20 +1859,15 @@ pub(super) fn test_network_requests_and_har(ctx: &mut E2ECtx) {
         failed.stdout
     );
 
-    // 5. Request detail — parse the list as JSON to find the ok request id.
-    let list_json: serde_json::Value =
-        serde_json::from_str(&strip_snapshot_output(&list_output))
-            .unwrap_or_else(|e| panic!("network requests output should be JSON: {e}\n{}", list_output));
-    let ok_entry = list_json
-        .as_array()
-        .and_then(|arr| {
-            arr.iter().find(|entry| {
-                entry["url"]
-                    .as_str()
-                    .is_some_and(|url| url.contains("network-endpoint-ok"))
-            })
+    // 5. Request detail — the ok request's id comes from the tracked buffer.
+    let ok_entry = entries
+        .iter()
+        .find(|entry| {
+            entry["url"]
+                .as_str()
+                .is_some_and(|url| url.contains("network-endpoint-ok"))
         })
-        .unwrap_or_else(|| panic!("expected an entry for network-endpoint-ok in:\n{}", list_json));
+        .unwrap_or_else(|| panic!("expected an entry for network-endpoint-ok in:\n{listed}"));
     let request_id = ok_entry["requestId"]
         .as_str()
         .unwrap_or_else(|| panic!("expected requestId in entry:\n{ok_entry}"));
@@ -1953,6 +1994,28 @@ pub(super) fn test_network_requests_and_har(ctx: &mut E2ECtx) {
         "network route --abort should confirm the route, got:\n{}",
         abort.stdout
     );
+
+    // Registering a route is inspectable without removing it first: `network routes`
+    // reports the tab's active routes in registration order.  Asserted while both
+    // routes are live, so the count and the pairing of pattern to action are real.
+    let routes = run_command(ctx, &["network", "routes"]);
+    assert!(
+        routes.stdout.contains("Request routes (2 registered):"),
+        "network routes should count the two registered routes, got:\n{}",
+        routes.stdout
+    );
+    assert!(
+        routes.stdout.contains("**/api/network-endpoint-ok.json")
+            && routes.stdout.contains("**/api/network-endpoint-missing.json"),
+        "network routes should list both patterns, got:\n{}",
+        routes.stdout
+    );
+    assert!(
+        routes.stdout.contains("abort") && routes.stdout.contains("mock: application/json"),
+        "network routes should pair each pattern with its action, got:\n{}",
+        routes.stdout
+    );
+
     run_command(ctx, &["goto", &ctx.other_url()]);
     run_command(ctx, &["goto", &ctx.network_url()]);
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -1973,6 +2036,14 @@ pub(super) fn test_network_requests_and_har(ctx: &mut E2ECtx) {
         unroute.stdout.contains("unrouted"),
         "network unroute should confirm removal, got:\n{}",
         unroute.stdout
+    );
+    let routes_after_unroute = run_command(ctx, &["network", "routes"]);
+    assert!(
+        routes_after_unroute
+            .stdout
+            .contains("No request routes are registered on this tab."),
+        "network unroute should leave no registered routes, got:\n{}",
+        routes_after_unroute.stdout
     );
     run_command(ctx, &["goto", &ctx.other_url()]);
     run_command(ctx, &["goto", &ctx.network_url()]);
@@ -3248,6 +3319,168 @@ pub(super) fn test_e2e_console_capture_is_page_silent(ctx: &mut E2ECtx) {
 }
 
 // ---------------------------------------------------------------------------
+// Device emulation persistence — `set device` state must survive `goto`/`resize`
+// ---------------------------------------------------------------------------
+
+/// The viewport the page itself reports, as `<innerWidth>x<innerHeight>@<dpr>`.
+///
+/// Evaluated in the page (not read back from the driver), so every assertion below is
+/// about what a page can observe.  The expression is deliberately page-independent:
+/// the cross-URL leg of the test runs on a fixture that carries no probe of its own.
+fn read_device_metrics(ctx: &mut E2ECtx) -> String {
+    last_non_empty_line(&eval_text(
+        ctx,
+        "innerWidth + 'x' + innerHeight + '@' + devicePixelRatio",
+    ))
+    .to_string()
+}
+
+/// Read the metrics, retrying briefly: an emulation override lands as an asynchronous
+/// viewport change, so a single immediate read can race the commit.
+fn wait_for_device_metrics(ctx: &mut E2ECtx, expected: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut actual = read_device_metrics(ctx);
+    while actual != expected && Instant::now() < deadline {
+        sleep(Duration::from_millis(250));
+        actual = read_device_metrics(ctx);
+    }
+    actual
+}
+
+fn assert_device_metrics(ctx: &mut E2ECtx, expected: &str, why: &str) {
+    let actual = wait_for_device_metrics(ctx, expected);
+    assert_eq!(actual, expected, "{why}");
+}
+
+/// Device metrics survive `goto` and `resize`.
+///
+/// `Emulation.setDeviceMetricsOverride` is replace-only — it overwrites every field and no
+/// CDP call reads the active override back — so the driver memoizes what it applied. Two
+/// regressions a page can observe are pinned here:
+///
+/// * `goto` normalises the viewport, which used to drop the caller's emulation even though
+///   `reload` kept it (an asymmetry with nothing in the output to explain it);
+/// * `resize` re-issued the override with `deviceScaleFactor = 0.0, mobile = false`, so a
+///   resized tab silently came back at dpr 1 and reported success.
+///
+/// The mobile phase runs on `emulation-fixture.html`, which declares `width=device-width`:
+/// with `mobile: true` Chrome honours that meta tag, so the layout viewport follows the
+/// emulated width instead of its 980px mobile default and the reported size stays exact.
+pub(super) fn test_e2e_device_emulation_persistence(ctx: &mut E2ECtx) {
+    reset_cli_artifacts(ctx);
+
+    let emulation_url = ctx.emulation_url();
+    run_command(ctx, &["open", &emulation_url, OPEN_PROFILE_MODE_ARG]);
+    sleep(Duration::from_secs(2));
+
+    // The viewport the browser runs at on its own, for the post-clear comparison.
+    let baseline = read_device_metrics(ctx);
+    assert!(
+        !baseline.is_empty()
+            && baseline != "null"
+            && !baseline.starts_with("500x700")
+            && !baseline.starts_with("390x844"),
+        "the fixture must report the browser's own viewport before any emulation, got: {baseline:?}"
+    );
+
+    // ── 1. `set device` reaches the page and reports what it applied ──────────
+    let applied = run_command(
+        ctx,
+        &[
+            "set", "device", "--width", "500", "--height", "700", "--dpr", "2",
+        ],
+    );
+    assert!(
+        applied.stdout.contains("Device metrics emulated: 500x700 @dpr 2"),
+        "set device must report the metrics it applied, got:\n{}",
+        applied.stdout
+    );
+    assert_device_metrics(
+        ctx,
+        "500x700@2",
+        "the emulated metrics must be what the page sees",
+    );
+
+    // ── 2. a cross-URL `goto` re-applies the active emulation ────────────────
+    let other_url = ctx.other_url();
+    run_command(ctx, &["goto", &other_url]);
+    sleep(Duration::from_secs(2));
+    assert_eq!(
+        last_non_empty_line(&eval_text(ctx, "document.title")),
+        OTHER_TITLE,
+        "the cross-URL navigation must have happened"
+    );
+    assert_device_metrics(
+        ctx,
+        "500x700@2",
+        "`goto` must re-apply the device emulation its viewport normalisation replaces",
+    );
+
+    // The emulation must survive the way back too, and the mobile phase below needs
+    // the fixture's `width=device-width` (Chrome's mobile default is 980px).
+    let back_url = ctx.emulation_url();
+    run_command(ctx, &["goto", &back_url]);
+    sleep(Duration::from_secs(2));
+    assert_device_metrics(
+        ctx,
+        "500x700@2",
+        "the emulation must survive the return navigation as well",
+    );
+
+    // ── 3. `resize` changes the size and keeps the scale factor ──────────────
+    let resized = run_command(ctx, &["resize", "900", "800"]);
+    assert!(
+        resized.stdout.contains("✓ Resized to"),
+        "Expected '✓ Resized to' in resize output:\n{}",
+        resized.stdout
+    );
+    assert_device_metrics(
+        ctx,
+        "900x800@2",
+        "`resize` must carry deviceScaleFactor forward instead of resetting it to dpr 1",
+    );
+
+    // ── 4. the same two paths with the mobile flag on ────────────────────────
+    let mobile = run_command(
+        ctx,
+        &[
+            "set", "device", "--width", "390", "--height", "844", "--dpr", "3", "--mobile",
+        ],
+    );
+    assert!(
+        mobile.stdout.contains("Device metrics emulated: 390x844 @dpr 3, mobile=true"),
+        "set device --mobile must report the mobile flag it applied, got:\n{}",
+        mobile.stdout
+    );
+    assert_device_metrics(
+        ctx,
+        "390x844@3",
+        "a mobile emulation must be visible to the page (the fixture declares width=device-width)",
+    );
+
+    run_command(ctx, &["resize", "600", "620"]);
+    assert_device_metrics(
+        ctx,
+        "600x620@3",
+        "`resize` must keep the mobile emulation's scale factor as well",
+    );
+
+    // ── 5. clearing the override clears the memo ────────────────────────────
+    // `cdp` goes through the same `executeCdpCommand` the memo is written and cleared
+    // by, so the next navigation must stop re-applying the emulation.
+    run_command(ctx, &["cdp", "Emulation.clearDeviceMetricsOverride"]);
+    run_command(ctx, &["goto", &back_url]);
+    sleep(Duration::from_secs(2));
+    assert_device_metrics(
+        ctx,
+        &baseline,
+        "clearing the override must restore the browser's own viewport on the next navigation",
+    );
+
+    run_command(ctx, &["close"]);
+}
+
+// ---------------------------------------------------------------------------
 // agent-browser A/B-tier command gaps — real DOM behaviour on the interactive
 // fixture (the mock scenario covers CLI plumbing; this covers real effects)
 // ---------------------------------------------------------------------------
@@ -3613,8 +3846,9 @@ pub(super) fn test_frame_switch_commands(ctx: &mut E2ECtx) {
     assert!(frames_ready, "pay-frame iframe should load its document");
 
     // ── frames: the frame tree lists every iframe and marks the main frame active
+    // (the command renders a tree, not the backend's JSON — `references/frames.md`)
     let frames_out = run_command(ctx, &["frames"]);
-    for expected in ["payframe", "otherframe", "nestedframe", "frame-pay.html", "\"active\":true"] {
+    for expected in ["payframe", "otherframe", "nestedframe", "frame-pay.html", "[active]"] {
         assert!(
             frames_out.stdout.contains(expected),
             "frames output should contain '{expected}', got:\n{}",
@@ -3849,7 +4083,7 @@ pub(super) fn test_frame_switch_commands(ctx: &mut E2ECtx) {
     goto_interactive_page(ctx);
     let frames_after_nav = run_command(ctx, &["frames"]);
     assert!(
-        frames_after_nav.stdout.contains("\"active\":true"),
+        frames_after_nav.stdout.contains("[active]"),
         "frames after navigation should still list the main frame as active, got:\n{}",
         frames_after_nav.stdout
     );
@@ -3971,18 +4205,22 @@ fn json_field_value(stdout: &str, field: &str) -> Option<i64> {
     None
 }
 
-/// Extract the CDP frame id of the frame whose `name` equals [name] from a
-/// `frames` command payload (a JSON array of frame objects).
+/// Extract the CDP frame id of the frame whose name equals [name] from `frames`
+/// output, which renders one tree line per frame:
+/// `  └ payframe — http://host/frame-pay.html (id=A8F5…)`.
 fn named_frame_id(stdout: &str, name: &str) -> Option<String> {
-    let start = stdout.find('[')?;
-    let end = stdout.rfind(']')?;
-    let value: serde_json::Value = serde_json::from_str(&stdout[start..=end]).ok()?;
-    let frames = value.as_array()?;
-    frames
-        .iter()
-        .find(|frame| frame.get("name").and_then(|v| v.as_str()) == Some(name))
-        .and_then(|frame| frame.get("id").and_then(|v| v.as_str()))
-        .map(str::to_string)
+    stdout.lines().find_map(|line| {
+        let id_at = line.find("(id=")?;
+        let id_end = line[id_at..].find(')')? + id_at;
+        // The label sits between the tree prefix and the url separator, and may carry
+        // the `[active]` marker.
+        let label = line[..line.find('—')?]
+            .trim_start_matches([' ', '-', '└', '├', '│', '─'])
+            .trim_end()
+            .trim_end_matches("[active]")
+            .trim_end();
+        (label == name).then(|| line[id_at + "(id=".len()..id_end].to_string())
+    })
 }
 
 /// Test that a click reaches the page as trusted input instead of a synthetic DOM event.

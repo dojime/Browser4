@@ -146,6 +146,15 @@ pub struct CliState {
     /// recorded by older CLI versions and for attached sessions.
     #[serde(rename = "displayMode", default, skip_serializing_if = "Option::is_none")]
     pub display_mode: Option<String>,
+    /// Whether `stop` marked this record stale (see [`mark_all_sessions_stale`]).
+    ///
+    /// `stop` shuts the backend down, which drops every session it knew about;
+    /// the records are kept so `list` can show the documented Stale/Refresh rows
+    /// instead of the sessions vanishing.  The marker records that the session
+    /// outlived its server: the next write clears it, because a write means the
+    /// session was just validated against a (new) backend.
+    #[serde(rename = "stale", default, skip_serializing_if = "is_false")]
+    pub stale: bool,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -189,6 +198,7 @@ impl Default for CliState {
             created_at: None,
             last_accessed_at: None,
             display_mode: None,
+            stale: false,
         }
     }
 }
@@ -526,6 +536,10 @@ fn write_state_to_dir(
     let mut state = state.clone();
     state.is_attached = state.kind.is_attached();
     state.attach_type = state.kind.attach_type_str().map(|s| s.to_string());
+    // Writing a record means the session was just created, opened or refreshed
+    // against the backend, so a staleness marker left by an earlier `stop` (see
+    // `mark_all_sessions_stale`) no longer describes it.
+    state.stale = false;
 
     let json = serde_json::to_string_pretty(&state).expect("state serialization should not fail");
     atomic_write(&path, json.as_bytes())
@@ -612,6 +626,89 @@ fn clear_session_files_in_dir(dir: &Path) {
             }
         }
     }
+}
+
+/// Mark the default record and every named session record as stale instead of
+/// deleting them (the `stop` path).
+///
+/// `stop` shuts the backend down, so every session it knew about is gone — but
+/// the *records* must survive.  `clear_all_state` used to run here as well, so
+/// `sessions/*.json` vanished and the next `list` printed
+/// "No active browser sessions." — sessions the user named disappeared instead
+/// of showing the documented `Stale` / `Refresh` row (the same row `close-all`
+/// counts), and it looked as though the sessions and their stored profile state
+/// had been destroyed.
+///
+/// Deletion stays reserved for `close`, `close-all` and `kill-all`, which go
+/// through [`clear_all_state`].
+///
+/// Each surviving record keeps every field it had (the session id included, so
+/// a later `goto -s <name>` can revive it) and gains `"stale": true`.  Files
+/// that do not parse as JSON objects are left untouched rather than
+/// overwritten, so this can never destroy state written by another version.
+///
+/// Returns the number of records marked.
+pub fn mark_all_sessions_stale(state_dir: Option<&Path>) -> usize {
+    let dir = state_dir
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(resolve_default_state_dir);
+
+    // Mirror `clear_all_state`: legacy fallback copies in the CWD-relative
+    // directory are marked too when the implicit default dir is in use.
+    if is_implicit_default_dir(state_dir) {
+        mark_sessions_stale_in_dir(&dir) + mark_sessions_stale_in_dir(&fallback_state_dir())
+    } else {
+        mark_sessions_stale_in_dir(&dir)
+    }
+}
+
+/// Mark the default record (`cli-state.json`) plus every `{dir}/sessions/*.json`
+/// file stale.  Best-effort: an unreadable directory marks nothing.
+fn mark_sessions_stale_in_dir(dir: &Path) -> usize {
+    let mut marked = 0;
+
+    if mark_state_file_stale(&state_file(dir, None)) {
+        marked += 1;
+    }
+
+    let sessions_dir = dir.join("sessions");
+    if let Ok(entries) = fs::read_dir(sessions_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().map_or(false, |ext| ext == "json")
+                && mark_state_file_stale(&path)
+            {
+                marked += 1;
+            }
+        }
+    }
+
+    marked
+}
+
+/// Set `"stale": true` in one persisted state file, preserving every other
+/// field as written (including fields this CLI version does not know about).
+///
+/// Returns `false` when the file does not exist or is not a JSON object.
+fn mark_state_file_stale(path: &Path) -> bool {
+    let Ok(raw) = fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    let Some(object) = value.as_object_mut() else {
+        return false;
+    };
+    if object.get("stale").and_then(|v| v.as_bool()) == Some(true) {
+        return true;
+    }
+    object.insert("stale".to_string(), serde_json::Value::Bool(true));
+
+    let Ok(json) = serde_json::to_string_pretty(&value) else {
+        return false;
+    };
+    atomic_write(path, json.as_bytes()).is_ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -1161,6 +1258,21 @@ pub fn format_duration_ms(ms: i64) -> String {
     format!("{}h{:02}m", hours, minutes % 60)
 }
 
+/// Wall-clock time from submission to completion in milliseconds — the
+/// time-to-result the DURATION column does not show.
+///
+/// DURATION is the backend's `startedAt → completedAt` window, and the backend
+/// can stamp `startedAt` so late (microseconds before completion) that a task
+/// which waited a minute in the queue reports single-digit milliseconds.  This
+/// value is derived from `submittedAt`, which the CLI records when it submits
+/// the task, so it stays meaningful even when `startedAt` is absent or wrong.
+/// `None` while the task has not finished (no completion timestamp yet).
+pub fn task_elapsed_ms(entry: &AsyncTaskEntry) -> Option<i64> {
+    let finished = entry.completed_at.as_deref().and_then(parse_timestamp)?;
+    let submitted = parse_timestamp(&entry.submitted_at)?;
+    Some((finished - submitted).num_milliseconds().max(0))
+}
+
 /// Persisted list of tracked async tasks.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AsyncTaskList {
@@ -1396,25 +1508,33 @@ pub fn format_async_task_list_opts(
         .max()
         .unwrap_or(8)
         .max(8);
+    let elapsed_w = page
+        .iter()
+        .map(|t| task_elapsed_ms(t).map(format_duration_ms).map(|s| s.len()).unwrap_or(1))
+        .max()
+        .unwrap_or(7)
+        .max(7);
 
     out.push(format!(
-        "  {:<id_w$}  {:<cmd_w$}  {:<desc_w$}  {:<time_w$}  {:<time_w$}  {:<dur_w$}  {:<status_w$}",
-        "TASK ID", "COMMAND", "DESCRIPTION", "STARTED", "FINISHED", "DURATION", "STATUS",
+        "  {:<id_w$}  {:<cmd_w$}  {:<desc_w$}  {:<time_w$}  {:<time_w$}  {:<dur_w$}  {:<elapsed_w$}  {:<status_w$}",
+        "TASK ID", "COMMAND", "DESCRIPTION", "STARTED", "FINISHED", "DURATION", "ELAPSED", "STATUS",
         id_w = id_w,
         cmd_w = cmd_w,
         desc_w = desc_w,
         time_w = time_w,
         dur_w = dur_w,
+        elapsed_w = elapsed_w,
         status_w = status_w,
     ));
     out.push(format!(
-        "  {:-<id_w$}  {:-<cmd_w$}  {:-<desc_w$}  {:-<time_w$}  {:-<time_w$}  {:-<dur_w$}  {:-<status_w$}",
-        "", "", "", "", "", "", "",
+        "  {:-<id_w$}  {:-<cmd_w$}  {:-<desc_w$}  {:-<time_w$}  {:-<time_w$}  {:-<dur_w$}  {:-<elapsed_w$}  {:-<status_w$}",
+        "", "", "", "", "", "", "", "",
         id_w = id_w,
         cmd_w = cmd_w,
         desc_w = desc_w,
         time_w = time_w,
         dur_w = dur_w,
+        elapsed_w = elapsed_w,
         status_w = status_w,
     ));
 
@@ -1449,6 +1569,11 @@ pub fn format_async_task_list_opts(
         let duration = task_duration_ms(entry)
             .map(format_duration_ms)
             .unwrap_or_else(|| "-".to_string());
+        // ELAPSED is submission → completion: the time-to-result the backend's
+        // DURATION window misses while it stamps `startedAt` at completion.
+        let elapsed = task_elapsed_ms(entry)
+            .map(format_duration_ms)
+            .unwrap_or_else(|| "-".to_string());
         // Rust's width specifier pads but never truncates, so an id longer than
         // id_w would print in full and shift every following column out of the
         // header grid. Cap the cell (ellipsis) — standard 36-char UUIDs fit.
@@ -1458,19 +1583,21 @@ pub fn format_async_task_list_opts(
             entry.task_id.clone()
         };
         out.push(format!(
-            "  {:<id_w$}  {:<cmd_w$}  {:<desc_w$}  {:<time_w$}  {:<time_w$}  {:<dur_w$}  {:<status_w$}",
+            "  {:<id_w$}  {:<cmd_w$}  {:<desc_w$}  {:<time_w$}  {:<time_w$}  {:<dur_w$}  {:<elapsed_w$}  {:<status_w$}",
             id_cell,
             entry.command,
             desc,
             started,
             finished,
             duration,
+            elapsed,
             status,
             id_w = id_w,
             cmd_w = cmd_w,
             desc_w = desc_w,
             time_w = time_w,
             dur_w = dur_w,
+            elapsed_w = elapsed_w,
             status_w = status_w,
         ));
     }
@@ -2096,6 +2223,88 @@ mod tests {
         assert!(tmp.path().join("sessions").join("notes.txt").exists());
     }
 
+    /// `stop` must keep the session records (so `list` can show the documented
+    /// Stale/Refresh rows) while `clear_all_state` — the close/close-all/kill-all
+    /// path — still deletes them.
+    #[test]
+    fn test_mark_all_sessions_stale_keeps_default_and_named_records() {
+        let tmp = test_temp_dir();
+        let default_state = CliState {
+            session_id: Some("default123".to_string()),
+            ..CliState::default()
+        };
+        let named_state = CliState {
+            session_id: Some("named123".to_string()),
+            session_name: Some("named".to_string()),
+            display_mode: Some("headless".to_string()),
+            ..CliState::default()
+        };
+
+        write_state(&default_state, Some(tmp.path()), None).unwrap();
+        write_state(&named_state, Some(tmp.path()), Some("named")).unwrap();
+        fs::write(tmp.path().join("sessions").join("notes.txt"), "keep").unwrap();
+
+        let marked = mark_all_sessions_stale(Some(tmp.path()));
+        assert_eq!(marked, 2, "the default and the named record must be marked");
+
+        // Both records survive, with every field intact.
+        let default_read = read_state(Some(tmp.path()), None);
+        let named_read = read_state(Some(tmp.path()), Some("named"));
+        assert_eq!(default_read.session_id.as_deref(), Some("default123"));
+        assert_eq!(named_read.session_id.as_deref(), Some("named123"));
+        assert_eq!(named_read.display_mode.as_deref(), Some("headless"));
+        assert!(default_read.stale);
+        assert!(named_read.stale);
+        assert!(tmp.path().join("sessions").join("notes.txt").exists());
+
+        // Marking is idempotent and reports the same count.
+        assert_eq!(mark_all_sessions_stale(Some(tmp.path())), 2);
+        assert!(read_state(Some(tmp.path()), Some("named")).stale);
+
+        // Any later write clears the marker: the session was just revalidated.
+        write_state(&named_read, Some(tmp.path()), Some("named")).unwrap();
+        assert!(!read_state(Some(tmp.path()), Some("named")).stale);
+
+        // The delete path (close / close-all / kill-all) still removes them.
+        mark_all_sessions_stale(Some(tmp.path()));
+        clear_all_state(Some(tmp.path()));
+        assert!(!state_file(tmp.path(), None).exists());
+        assert!(!state_file(tmp.path(), Some("named")).exists());
+    }
+
+    /// Marking must never lose data: unknown fields written by another CLI
+    /// version stay, and a file that is not a JSON object is left alone.
+    #[test]
+    fn test_mark_state_file_stale_preserves_unknown_fields() {
+        let tmp = test_temp_dir();
+        let sessions = tmp.path().join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        let future = sessions.join("future.json");
+        // A record written by a newer CLI version: a complete, readable state
+        // object plus a field this version does not know about.
+        fs::write(
+            &future,
+            r#"{"sessionId":"s1","baseUrl":"http://localhost:18182","unknownFieldFromNewerCli":{"a":1}}"#,
+        )
+        .unwrap();
+        assert!(mark_state_file_stale(&future));
+        let raw = fs::read_to_string(&future).unwrap();
+        assert!(raw.contains("unknownFieldFromNewerCli"), "raw:\n{raw}");
+        assert!(raw.contains("\"stale\": true"), "raw:\n{raw}");
+        assert_eq!(
+            read_state(Some(tmp.path()), Some("future")).session_id.as_deref(),
+            Some("s1")
+        );
+
+        // Not JSON / not an object / missing: nothing is rewritten.
+        let broken = sessions.join("broken.json");
+        fs::write(&broken, "not json").unwrap();
+        assert!(!mark_state_file_stale(&broken));
+        assert_eq!(fs::read_to_string(&broken).unwrap(), "not json");
+        assert!(!mark_state_file_stale(&sessions.join("missing.json")));
+    }
+
     // -------------------------------------------------------------------
     // Async task tracking tests (crawl, agent, swarm)
     // -------------------------------------------------------------------
@@ -2668,6 +2877,64 @@ mod tests {
         assert_eq!(format_duration_ms(3_725_000), "1h02m");
         // Negative input (clock skew) must not produce nonsense.
         assert_eq!(format_duration_ms(-5), "0ms");
+    }
+
+    /// The backend can stamp `startedAt` microseconds before completion while
+    /// the task waited in the queue, so DURATION reads ~0ms although the result
+    /// took a minute.  ELAPSED (submitted → completed) stays truthful.
+    #[test]
+    fn task_elapsed_ms_uses_submission_time_not_the_backend_start() {
+        let mut waited = entry("swarm-submit", "completed");
+        waited.submitted_at = "2026-07-22T00:00:00Z".to_string();
+        waited.started_at = Some("2026-07-22T00:00:59.999Z".to_string());
+        waited.completed_at = Some("2026-07-22T00:01:00Z".to_string());
+        waited.duration_ms = Some(1);
+        assert_eq!(task_duration_ms(&waited), Some(1));
+        assert_eq!(task_elapsed_ms(&waited), Some(60_000));
+
+        // Unfinished tasks have no time-to-result yet.
+        let mut running = entry("swarm-submit", "processing");
+        running.submitted_at = "2026-07-22T00:00:00Z".to_string();
+        assert_eq!(task_elapsed_ms(&running), None);
+
+        // Without a parseable submission timestamp there is nothing to derive.
+        let mut unparsable = entry("swarm-submit", "completed");
+        unparsable.submitted_at = String::new();
+        unparsable.completed_at = Some("2026-07-22T00:01:00Z".to_string());
+        assert_eq!(task_elapsed_ms(&unparsable), None);
+    }
+
+    /// `swarm list` / `crawl list` must show time-to-result without `--json`.
+    #[test]
+    fn format_async_task_list_renders_elapsed_column() {
+        let list = AsyncTaskList {
+            tasks: vec![AsyncTaskEntry {
+                task_id: "waited".to_string(),
+                command: "swarm-submit".to_string(),
+                description: "https://a.com".to_string(),
+                submitted_at: "2026-07-22T14:00:00Z".to_string(),
+                last_status: "completed".to_string(),
+                started_at: Some("2026-07-22T14:05:30Z".to_string()),
+                completed_at: Some("2026-07-22T14:05:30.010Z".to_string()),
+                duration_ms: Some(10),
+                ..Default::default()
+            }],
+        };
+        let output = format_async_task_list(&list, None, None);
+        let header = output
+            .lines()
+            .find(|l| l.contains("TASK ID"))
+            .unwrap_or_else(|| panic!("missing header:\n{output}"));
+        assert!(header.contains("ELAPSED"), "header:\n{header}");
+        let row = output
+            .lines()
+            .find(|l| l.contains("waited"))
+            .unwrap_or_else(|| panic!("missing row:\n{output}"));
+        assert!(row.contains("10ms"), "DURATION cell missing: {row}");
+        assert!(
+            row.contains("5m30s"),
+            "ELAPSED cell (submitted -> completed) missing: {row}"
+        );
     }
 
     #[test]

@@ -1217,7 +1217,13 @@ pub(super) fn test_stop_no_running_server(ctx: &mut E2ECtx) {
     );
 }
 
-pub(super) fn test_stop_clears_state(ctx: &mut E2ECtx) {
+/// `stop` stops the backend but KEEPS the session records, marked stale.
+///
+/// Deleting them made sessions vanish from `list` (they could not be revived by a
+/// later `open`/`goto`), so `stop` only sets `"stale": true`; `close`,
+/// `close-all` and `kill-all` are the commands that delete records — `kill-all`
+/// is covered by `test_e2e_kill_all_clears_state_and_registry`.
+pub(super) fn test_stop_marks_state_stale(ctx: &mut E2ECtx) {
     reset_cli_artifacts(ctx);
 
     let mock_server = MockBrowser4Server::start();
@@ -1228,11 +1234,8 @@ pub(super) fn test_stop_clears_state(ctx: &mut E2ECtx) {
         "sessionId": "swarm-session-1",
         "baseUrl": mock_server.base_url(),
     });
-    fs::write(
-        state_file_path(&ctx.state_dir, None),
-        default_state.to_string(),
-    )
-    .expect("write default state");
+    let default_path = state_file_path(&ctx.state_dir, None);
+    fs::write(&default_path, default_state.to_string()).expect("write default state");
 
     let auth_path = state_file_path(&ctx.state_dir, Some("auth"));
     fs::create_dir_all(auth_path.parent().unwrap()).expect("create sessions dir");
@@ -1249,15 +1252,31 @@ pub(super) fn test_stop_clears_state(ctx: &mut E2ECtx) {
     let result = run_command(ctx, &["stop"]);
     assert_eq!(result.exit_code, 0);
 
-    // stop must clear all state.
-    assert!(
-        !state_file_path(&ctx.state_dir, None).exists(),
-        "Expected default state to be removed after stop"
-    );
-    assert!(
-        !auth_path.exists(),
-        "Expected named state to be removed after stop"
-    );
+    // Both records survive and carry the staleness marker.
+    for (label, path) in [("default", &default_path), ("named", &auth_path)] {
+        assert!(
+            path.exists(),
+            "stop must keep the {label} session record so `list` can show it as stale"
+        );
+        let record: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(path).unwrap_or_else(|e| panic!("read {label} state: {e}")),
+        )
+        .unwrap_or_else(|e| panic!("parse {label} state: {e}"));
+        assert_eq!(
+            record["stale"],
+            serde_json::json!(true),
+            "stop must mark the {label} session record stale, got: {record}"
+        );
+        assert_eq!(
+            record["sessionId"],
+            if label == "default" {
+                serde_json::json!("swarm-session-1")
+            } else {
+                serde_json::json!("swarm-session-auth")
+            },
+            "stop must preserve the record's session id, got: {record}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2858,10 +2877,20 @@ pub(super) fn test_agent_browser_command_gaps(ctx: &mut E2ECtx) {
     );
 
     // ── 10. pushstate (synthesizes browser_evaluate) ──────────────────
-    let pushstate = run_command(ctx, &["pushstate", "/new-path"]);
-    assert_eq!(
-        strip_snapshot_output(&pushstate.stdout),
-        "mock evaluation result"
+    // `pushstate` now verifies that the URL actually changed, and this mock answers
+    // `current_url` with the same canned text before and after the push — so the
+    // correct outcome against a static mock is the loud failure, not a silent exit 0.
+    // The happy path (URL really changes) is covered live by
+    // `test_agent_browser_command_gaps_live`.
+    let pushstate = run_command_expecting_failure(
+        ctx,
+        &["pushstate", "/new-path"],
+        "history.pushState did not change the page URL",
+    );
+    assert!(
+        pushstate.stderr.contains("mock response for current_url"),
+        "the failure must name the URL it saw, got:\n{}",
+        pushstate.stderr
     );
 
     // ── 11. highlight (synthesizes browser_evaluate) ──────────────────
@@ -2872,20 +2901,31 @@ pub(super) fn test_agent_browser_command_gaps(ctx: &mut E2ECtx) {
     );
 
     // ── 12. set (CDP emulation) ───────────────────────────────────────
+    // `set` reports what it applied instead of echoing the raw CDP payload (it used to
+    // print the empty result object), so the recorded tool call is what proves the right
+    // CDP method reached the backend.
     let set_geo = run_command(
         ctx,
         &["set", "geo", "--lat=37.7749", "--lon=-122.4194"],
     );
     assert!(
-        set_geo.stdout.contains("Emulation.setGeolocationOverride"),
-        "set geo should call Emulation.setGeolocationOverride, got:\n{}",
+        set_geo
+            .stdout
+            .contains("Geolocation emulated: latitude=37.7749, longitude=-122.4194"),
+        "set geo should report the position it applied, got:\n{}",
         set_geo.stdout
     );
-    assert!(
-        set_geo.stdout.contains("mock-cdp-result"),
-        "set geo output should contain mock-cdp-result, got:\n{}",
-        set_geo.stdout
-    );
+    let geo_call = mock_server
+        .snapshot()
+        .tool_calls
+        .into_iter()
+        .find(|call| {
+            call.tool == "execute_cdp_command"
+                && call.arguments["method"] == "Emulation.setGeolocationOverride"
+        })
+        .unwrap_or_else(|| panic!("set geo should call Emulation.setGeolocationOverride"));
+    assert_eq!(geo_call.arguments["params"]["latitude"], 37.7749);
+    assert_eq!(geo_call.arguments["params"]["longitude"], -122.4194);
 
     // ── 13. window-new (browser_tabs "new" action) ────────────────────
     let window_new = run_command(

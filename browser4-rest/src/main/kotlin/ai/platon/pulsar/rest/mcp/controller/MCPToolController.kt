@@ -24,7 +24,10 @@ import ai.platon.pulsar.agentic.tools.builtin.CodingToolExecutor
 import ai.platon.pulsar.coding.CodingAgentShell
 import ai.platon.pulsar.coding.CodingAgentFileSystem
 import ai.platon.pulsar.coding.CodingWorkspace
+import ai.platon.pulsar.chrome.Browser4WebDriver
+import ai.platon.pulsar.rest.session.ManagedSession
 import ai.platon.pulsar.rest.session.PulsarSessionManager
+import ai.platon.pulsar.rest.session.SessionStatus
 import ai.platon.pulsar.common.brief
 import ai.platon.pulsar.common.serialize.json.pulsarObjectMapper
 import ai.platon.pulsar.dom.FeaturedDocument
@@ -37,6 +40,7 @@ import com.fasterxml.jackson.annotation.JsonSetter
 import com.fasterxml.jackson.annotation.Nulls
 import com.fasterxml.jackson.databind.node.ArrayNode
 import jakarta.servlet.http.HttpServletResponse
+import kotlinx.coroutines.withTimeoutOrNull
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.boot.autoconfigure.condition.ConditionalOnBean
@@ -191,6 +195,40 @@ class MCPToolController(
     /** Same validation rules as the standard MCP server (see ToolSpecValidator). */
     private val validator = ToolSpecValidator.fromSystemProperties()
 
+    /**
+     * Session-scoped tools that read or manipulate the page over CDP and are
+     * therefore blocked by an open native dialog.
+     *
+     * The tool layer guards the page-state reads and the eval family
+     * (`BrowserTabToolExecutor.DIALOG_GUARDED_ACTIONS`); the tab and frame
+     * handlers live in a different executor and were left out, so a pending
+     * dialog made `tab-list` wait out the client's HTTP timeout and then report
+     * a network error. Interactive actions (click/fill/type/press) stay out of
+     * the guard: they are the calls that legitimately OPEN a dialog.
+     */
+    private val dialogGuardedSessionTools: Set<Pair<String, String>> = setOf(
+        "browser" to "listTabs",
+        "browser" to "newTab",
+        "browser" to "switchTab",
+        "browser" to "closeTab",
+        "tab" to "frameList",
+        "tab" to "frameSwitch",
+        "tab" to "frameMain",
+    )
+
+    /**
+     * The dialog-pending failure for [managed], or null when no native dialog is
+     * open (or the session has no bound driver to ask).
+     *
+     * The message is the driver's own (`Browser4WebDriver.requireNoPendingDialog`),
+     * so the CLI and the tool layer say the same thing and name the same two
+     * commands.
+     */
+    private fun pendingDialogMessage(managed: ManagedSession): String? {
+        val driver = managed.agenticSession.boundDriver as? Browser4WebDriver ?: return null
+        return runCatching { driver.requireNoPendingDialog() }.exceptionOrNull()?.message
+    }
+
     companion object {
         /** Log/metrics channel label for the private dispatcher. */
         internal const val CHANNEL = "B"
@@ -204,6 +242,13 @@ class MCPToolController(
 
         /** The client-supplied flag that bypasses the result cache for one call. */
         internal const val CACHE_FLAG = "cache"
+
+        /**
+         * How long the session listing waits for one driver to report its current
+         * URL. A wedged page (a pending dialog, a dead transport) must not stall
+         * `list`, which is the command a user runs to diagnose exactly that.
+         */
+        private const val SESSION_URL_PROBE_TIMEOUT_MS = 3_000L
 
         /**
          * Playwright-MCP style frontend tool name aliases: the names an agent
@@ -252,6 +297,9 @@ class MCPToolController(
             "browser_network_request" to "network_request",
             "browser_network_route" to "network_route",
             "browser_network_unroute" to "network_unroute",
+            // Read-only counterpart of network_route/network_unroute: inspecting
+            // the active routes must not require removing them first.
+            "browser_network_routes" to "network_routes",
             "browser_har_start" to "har_start",
             "browser_har_stop" to "har_stop",
             "browser_frame_list" to "frame_list",
@@ -305,6 +353,7 @@ class MCPToolController(
             "network_request" to ("tab" to "networkRequestDetail"),
             "network_route" to ("tab" to "networkRoute"),
             "network_unroute" to ("tab" to "networkUnroute"),
+            "network_routes" to ("tab" to "networkRoutes"),
             "har_start" to ("tab" to "harStart"),
             "har_stop" to ("tab" to "harStop"),
             "frame_list" to ("tab" to "frameList"),
@@ -686,7 +735,7 @@ class MCPToolController(
             val healthy = runCatching { sessionManager.checkHealthy(s).isOK }.getOrDefault(false)
             mapOf<String, Any>(
                 "sessionId" to s.sessionId,
-                "url" to (s.url ?: ""),
+                "url" to sessionPageUrl(s, live = s.status == SessionStatus.ACTIVE),
                 "status" to s.status.wire,
                 "healthy" to healthy,
                 "kind" to s.kind.name,
@@ -711,6 +760,36 @@ class MCPToolController(
         }
         val json = pulsarObjectMapper().writeValueAsString(sessions)
         return ResponseEntity.ok(textResponse(json))
+    }
+
+    /**
+     * The current page URL of [managed], or `""` when it cannot be determined.
+     *
+     * `ManagedSession.url` is never written by any code path, so serializing it
+     * directly reported every live session as unknown — and the CLI renders the
+     * empty value as `-`, which its own docs define as "backend unreachable or
+     * session stale". A live session therefore advertised a dead backend. Ask
+     * the session's ALREADY-BOUND driver instead (the `boundDriver` accessor
+     * never launches a browser, unlike `ManagedSession.driver`), falling back to
+     * the stored value.
+     *
+     * Every failure path — no bound driver, a closed tab, a dead transport, a
+     * driver that does not answer in time — yields `""`: `list` is the command a
+     * user runs to find out what is wrong, so it must never be the thing that
+     * hangs.
+     */
+    private suspend fun sessionPageUrl(managed: ManagedSession, live: Boolean): String {
+        if (live) {
+            val liveUrl = runCatching {
+                withTimeoutOrNull(SESSION_URL_PROBE_TIMEOUT_MS) {
+                    managed.agenticSession.boundDriver?.currentUrl()?.takeIf { it.isNotBlank() }
+                }
+            }.getOrNull()
+            if (liveUrl != null) {
+                return liveUrl
+            }
+        }
+        return managed.url?.takeIf { it.isNotBlank() } ?: ""
     }
 
     private fun handleCloseAllSessions(): ResponseEntity<MCPToolCallResponse> {
@@ -1247,7 +1326,11 @@ class MCPToolController(
             val evaluate = result
             val exception = evaluate.exception
             if (exception != null) {
-                ResponseEntity.ok(errorResponse(buildErrorMessage(toolName, exception)))
+                // Classify from the failure, not from the composed text: the help
+                // block appended below carries parameter names like `waitTimeout`,
+                // and letting prose decide the code turned a stale-ref lookup miss
+                // into a retryable TIMEOUT (see ToolErrorMapper.isTargetMiss).
+                ResponseEntity.ok(errorResponse(buildErrorMessage(toolName, exception), exception.cause))
             } else {
                 val text = ToolResultTextRenderer.render(evaluate)
 
@@ -1677,12 +1760,27 @@ class MCPToolController(
         val toolCall = resolveMcpToolCall(toolName, args, agent)
             ?: return ResponseEntity.ok(errorResponse("Unknown tool: ${request.tool}"))
 
+        // The tool layer guards page-state reads and the eval family against a
+        // pending native dialog (BrowserTabToolExecutor.DIALOG_GUARDED_ACTIONS),
+        // but the session-scoped tab/frame handlers run CDP on the same blocked
+        // page and were left out: `tab-list` hung for the whole client timeout
+        // and then surfaced a network-timeout error. Check before dispatching so
+        // the failure is immediate and names the dialog instead.
+        if (dialogGuardedSessionTools.contains(toolCall.domain to toolCall.method)) {
+            pendingDialogMessage(managed)?.let { message ->
+                return ResponseEntity.ok(errorResponse(message, ToolErrorCode.DIALOG_PENDING))
+            }
+        }
+
         return try {
             val result = agent.agentToolManager.execute(toolCall)
             val evaluate = result.evaluate
             val exception = evaluate.exception
             if (exception != null) {
-                ResponseEntity.ok(errorResponse(buildErrorMessage(request.tool, exception)))
+                // Same as the other dispatchers: the code comes from the
+                // throwable, never from the composed text (which includes the
+                // appended tool description).
+                ResponseEntity.ok(errorResponse(buildErrorMessage(request.tool, exception), exception.cause))
             } else {
                 // Rendered by the shared renderer so the standard MCP server (8088)
                 // and this dispatcher return identical text for the same tool call.
@@ -1946,7 +2044,8 @@ class MCPToolController(
         // (__pulsar_utils__ — a session whose tab predates the backend process,
         // or a tab that never received the injected runtime) to an actionable
         // message instead of leaking the internal JS stack.
-        val message = if (isMissingPageHelperError(rawMessage)) missingPageHelperErrorMessage() else rawMessage
+        val mapped = if (isMissingPageHelperError(rawMessage)) missingPageHelperErrorMessage() else rawMessage
+        val message = toCliHints(mapped)
         val sb = StringBuilder("$toolName failed: $message")
 
         // Contextual tips for known error patterns
@@ -1957,13 +2056,31 @@ class MCPToolController(
         // Explicit help from the tool executor.  The static tool description /
         // signature attached by AbstractToolExecutor is only useful for usage
         // errors (missing/unknown parameters); on runtime errors it reads like
-        // a debug dump, so reserve it for usage errors.
+        // a debug dump, so reserve it for usage errors.  A target lookup miss is
+        // a runtime error even when the executor signalled it as a bad-argument
+        // type — the call's shape was valid, the page simply lacked the target.
         if (isUsageError(exception.cause, rawMessage) && !exception.help.isNullOrBlank()) {
             sb.append(" help: ${exception.help}")
         }
 
         return sb.toString()
     }
+
+    /**
+     * Translate API-facing recovery hints into the commands the caller can
+     * actually run.
+     *
+     * The frame-scope messages are composed in the driver, which knows the MCP
+     * method names (`frameList()`, `frameMain()`) but not the client's command
+     * surface: a user reading "List the page frames with `frameList()`" has no
+     * such command to run. Backticked and bare forms are both handled, so the
+     * translation cannot produce doubled backticks.
+     */
+    private fun toCliHints(message: String): String = message
+        .replace("`frameList()`", "`frames`")
+        .replace("frameList()", "`frames`")
+        .replace("`frameMain()`", "`frame main`")
+        .replace("frameMain()", "`frame main`")
 
     /**
      * Build a chain of exception messages from [e] through all its causes,
@@ -2022,8 +2139,14 @@ internal fun missingPageHelperErrorMessage(): String =
  * 'help:' text.  Static help is reserved for usage errors (bad parameters,
  * unknown fields/methods); runtime errors get their own actionable mapping and
  * must not read as a debug dump.
+ *
+ * A target lookup miss is a runtime error even when it arrives as an
+ * `IllegalArgumentException` — the call's shape was valid and the page simply
+ * lacked the element/ref/frame, so the 30-line signature dump would answer a
+ * question nobody asked.
  */
 internal fun isUsageError(cause: Throwable?, message: String): Boolean {
+    if (ToolErrorMapper.isTargetMiss(message)) return false
     if (cause is IllegalArgumentException) return true
     return listOf(
         "missing parameter",

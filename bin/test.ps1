@@ -160,6 +160,189 @@ function Invoke-CommandAndReport {
     return $exitCode
 }
 
+# ── Maven preflight helpers ──────────────────────────────────────────────
+# The mock-site preflight installs browser4-dependencies and browser4-rest
+# into the local Maven repository before booting the site.  Two facts drive
+# the helpers below:
+#   * `~/.m2/repository` is only Maven's *default* — a settings.xml that
+#     declares <localRepository> (common on Windows, where a redirected D:
+#     repository keeps C: free) moves every artifact Maven installs, so a scan
+#     of the default path reports "not cached" (or "no plugin JARs") for a
+#     repository that is in fact fully populated.
+#   * The first (cold) run takes 10-15 minutes; the cached run is seconds.
+#     Progress output must therefore be gated on the cache state, not printed
+#     unconditionally.
+
+function Get-MavenLocalRepositoryPath {
+    <#
+    .SYNOPSIS
+        Resolve Maven's effective local repository without starting a JVM.
+
+    .DESCRIPTION
+        Resolution order mirrors what Maven itself would use here:
+        MAVEN_REPO_LOCAL (the override this repo's scripts document) >
+        settings.xml <localRepository> (user settings, then the global
+        settings of MAVEN_HOME / M2_HOME) > ~/.m2/repository.
+
+        The settings.xml scan is a regex over the raw file rather than an XML
+        parse: it stays valid under PowerShell's ConstrainedLanguage mode and
+        does not care about namespaces or a BOM.
+
+    .PARAMETER RepoRoot
+        Repository root.  Unused today; kept so callers can pass project
+        context without changing the signature.
+
+    .OUTPUTS
+        String — the local repository path ('' when no home directory can be
+        resolved and no override is set).
+    #>
+    param([string]$RepoRoot = $repoRoot)
+
+    if ($env:MAVEN_REPO_LOCAL) { return $env:MAVEN_REPO_LOCAL }
+
+    $homeDir = if ($env:HOME) { $env:HOME }
+               elseif ($env:USERPROFILE) { $env:USERPROFILE }
+               else { '' }
+
+    $settingsCandidates = @()
+    if ($env:MAVEN_USER_HOME) { $settingsCandidates += (Join-Path $env:MAVEN_USER_HOME 'settings.xml') }
+    if ($homeDir) { $settingsCandidates += (Join-Path $homeDir (Join-Path '.m2' 'settings.xml')) }
+    foreach ($mavenHome in @($env:MAVEN_HOME, $env:M2_HOME)) {
+        if ($mavenHome) { $settingsCandidates += (Join-Path $mavenHome (Join-Path 'conf' 'settings.xml')) }
+    }
+
+    foreach ($settingsPath in $settingsCandidates) {
+        if (-not (Test-Path -LiteralPath $settingsPath -PathType Leaf)) { continue }
+        try {
+            $raw = Get-Content -LiteralPath $settingsPath -Raw -ErrorAction Stop
+        } catch {
+            continue
+        }
+        if ($raw -match '(?s)<localRepository>\s*([^<]+?)\s*</localRepository>') {
+            $declared = $Matches[1].Trim()
+            if ($declared.StartsWith('~') -and $homeDir) {
+                $declared = Join-Path $homeDir $declared.Substring(1).TrimStart('/', '\')
+            }
+            if ($declared) { return $declared }
+        }
+    }
+
+    if ($homeDir) { return (Join-Path $homeDir (Join-Path '.m2' 'repository')) }
+    return ''
+}
+
+function Test-MavenPreflightCacheState {
+    <#
+    .SYNOPSIS
+        Decide whether the mock-site preflight artifacts are already installed
+        locally (warm) or still have to be built (cold).
+
+    .DESCRIPTION
+        Decides only how loud the preflight is: the phases always run, so a
+        changed source tree is still recompiled and reinstalled — a warm cache
+        just runs them quietly and fast.
+
+    .PARAMETER LocalRepo
+        Maven local repository (see Get-MavenLocalRepositoryPath).
+
+    .PARAMETER Version
+        Project version (VERSION file).  An empty/unknown version cannot be
+        verified and is treated as "not cached".
+
+    .OUTPUTS
+        Hashtable with BomCached, RestCached, BomPath and RestPath.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$LocalRepo,
+        [string]$Version = ''
+    )
+
+    $groupPath = Join-Path 'ai' (Join-Path 'platon' 'pulsar')
+    $bomPath = ''
+    $restPath = ''
+    if ($LocalRepo -and $Version) {
+        $bomPath = Join-Path $LocalRepo (Join-Path $groupPath (Join-Path 'browser4-dependencies' `
+            (Join-Path $Version "browser4-dependencies-$Version.pom")))
+        $restPath = Join-Path $LocalRepo (Join-Path $groupPath (Join-Path 'browser4-rest' `
+            (Join-Path $Version "browser4-rest-$Version.jar")))
+    }
+
+    return @{
+        BomCached  = [bool]($bomPath -and (Test-Path -LiteralPath $bomPath -PathType Leaf))
+        RestCached = [bool]($restPath -and (Test-Path -LiteralPath $restPath -PathType Leaf))
+        BomPath    = $bomPath
+        RestPath   = $restPath
+    }
+}
+
+function Invoke-MavenInstallPhase {
+    <#
+    .SYNOPSIS
+        Run one Maven preflight phase with live progress, a heartbeat and a
+        tail-able log file.
+
+    .DESCRIPTION
+        The mock-site preflight is the only 10-15 minute Maven run in this
+        script, and it used to be completely silent (Maven ran with -q and the
+        wrapper only printed one banner per finished phase).  This runner:
+          * streams Maven's output line by line, dropping -q when the caller
+            asks for verbose progress (cold cache),
+          * tees every line to -LogPath and prints that path before the run,
+          * prints an elapsed-time heartbeat while Maven is quiet,
+          * returns Maven's exit code, so Invoke-CommandAndReport keeps its
+            [PASS]/[FAIL] banners and the script's exit-code contract.
+
+        The child inherits the caller's working directory, so pair this with
+        Invoke-CommandAndReport -PreExecPath (or Push-Location) as before.
+
+    .PARAMETER Label
+        Phase label used in the progress lines (banner comes from the caller).
+
+    .PARAMETER MvnArgs
+        Arguments for the Maven wrapper invocation, including '-q' when quiet.
+        '-q' is stripped when -ShowMavenOutput is set.
+
+    .PARAMETER LogPath
+        File that receives every line (UTF-8, no BOM).  A temp file is used and
+        removed afterwards when omitted.
+
+    .PARAMETER ShowMavenOutput
+        Drop '-q' so Maven prints its real module-by-module progress.  Passed
+        for a cold cache (see Test-MavenPreflightCacheState).
+
+    .PARAMETER HeartbeatSeconds
+        Heartbeat interval while Maven is silent.  0 disables heartbeats.
+
+    .OUTPUTS
+        Int32 — Maven's exit code.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Label,
+        [Parameter(Mandatory = $true)][string[]]$MvnArgs,
+        [string]$LogPath = '',
+        [switch]$ShowMavenOutput,
+        [int]$HeartbeatSeconds = 20
+    )
+
+    $effectiveArgs = @($MvnArgs)
+    if ($ShowMavenOutput) {
+        $effectiveArgs = @($effectiveArgs | Where-Object { $_ -ne '-q' })
+    } elseif ($effectiveArgs -notcontains '-q') {
+        $effectiveArgs += '-q'
+    }
+
+    Write-Host "  $Label — mvn $($effectiveArgs -join ' ')" -ForegroundColor DarkGray
+    if ($LogPath) {
+        Write-Host "  $Label — log: $LogPath (tail -f it to follow this phase)" -ForegroundColor DarkGray
+    }
+
+    $run = Invoke-ChildProcessStreaming -FilePath $mvnwScript -ArgumentList $effectiveArgs `
+        -LogFile $LogPath -HeartbeatSeconds $HeartbeatSeconds
+
+    Write-Host "  $Label — finished in $($run.DurationSec)s (exit $($run.ExitCode))" -ForegroundColor DarkGray
+    return $run.ExitCode
+}
+
 # kotlin-maven-plugin (2.x) daemon failure markers.  The plugin connects to
 # a KotlinCompileDaemon; stale daemons left by crashed builds or a second
 # Maven build running concurrently surface as opaque daemon connection
@@ -218,20 +401,68 @@ function Invoke-KotlinCompileWithRetry {
         Optional directory to Push-Location into before execution.
     .PARAMETER MvnArgs
         Arguments for the Maven wrapper invocation.
+
+    .PARAMETER LogFile
+        Optional per-attempt log file.  When set, the invocation runs through
+        Invoke-ChildProcessStreaming (live output + heartbeat + tee) instead of
+        the in-process Tee-Object pipeline, so a long silent Maven phase still
+        shows it is alive and its output survives a lost terminal.  The retry
+        writes to '<name>-attempt2<ext>' so the failed attempt is not lost.
+
+    .PARAMETER ShowMavenOutput
+        Drop '-q' so Maven prints its real module-by-module progress.
+
+    .PARAMETER HeartbeatSeconds
+        Heartbeat interval for the streaming path while Maven is silent.
     #>
     param(
         [Parameter(Mandatory)][string]$Label,
         [string]$PreExecPath = '',
-        [Parameter(Mandatory)][string[]]$MvnArgs
+        [Parameter(Mandatory)][string[]]$MvnArgs,
+        [string]$LogFile = '',
+        [switch]$ShowMavenOutput,
+        [int]$HeartbeatSeconds = 20
     )
     for ($attempt = 1; $attempt -le 2; $attempt++) {
         $exitCode = 1
+        $outputText = ''
+
+        $effectiveArgs = @($MvnArgs)
+        if ($ShowMavenOutput) {
+            $effectiveArgs = @($effectiveArgs | Where-Object { $_ -ne '-q' })
+        }
+
+        # Per-attempt log: a daemon retry must not overwrite the evidence of
+        # the failed first attempt.
+        $attemptLog = ''
+        if ($LogFile) {
+            if ($attempt -eq 1) {
+                $attemptLog = $LogFile
+            } else {
+                $logDir = Split-Path -Parent $LogFile
+                $logLeaf = [System.IO.Path]::GetFileNameWithoutExtension($LogFile)
+                $logExt = [System.IO.Path]::GetExtension($LogFile)
+                $attemptLog = Join-Path $logDir "$logLeaf-attempt$attempt$logExt"
+            }
+        }
+
         try {
             if ($PreExecPath) { Push-Location $PreExecPath }
             $global:LASTEXITCODE = 0
-            $output = & $mvnwScript @MvnArgs 2>&1 | Tee-Object -Variable bootOutput | Out-Host
-            $exitCode = $LASTEXITCODE
-            $output = $bootOutput
+            if ($attemptLog) {
+                # Streaming path: live echo, log tee and heartbeat.  The tail of
+                # the output is what the daemon-failure matcher inspects.
+                $attemptLabel = if ($attempt -eq 1) { $Label } else { "$Label (attempt $attempt)" }
+                Write-Host "  $attemptLabel — log: $attemptLog (tail -f it to follow this phase)" -ForegroundColor DarkGray
+                $run = Invoke-ChildProcessStreaming -FilePath $mvnwScript -ArgumentList $effectiveArgs `
+                    -LogFile $attemptLog -HeartbeatSeconds $HeartbeatSeconds -TailSize 200
+                $exitCode = $run.ExitCode
+                $outputText = (@($run.TailLines) -join [Environment]::NewLine)
+            } else {
+                $output = & $mvnwScript @effectiveArgs 2>&1 | Tee-Object -Variable bootOutput | Out-Host
+                $exitCode = $LASTEXITCODE
+                $outputText = ($bootOutput | Out-String)
+            }
         }
         catch {
             Write-Error "Failed to execute $Label`: $_"
@@ -246,7 +477,7 @@ function Invoke-KotlinCompileWithRetry {
             return 0
         }
 
-        $isDaemonFailure = (($output | Out-String) -match $script:KotlinDaemonErrorPattern)
+        $isDaemonFailure = ($outputText -match $script:KotlinDaemonErrorPattern)
         if ($attempt -eq 1 -and $isDaemonFailure) {
             Write-CommandBanner -Label "$Label hit a Kotlin compiler daemon error (exit code $exitCode) — retrying once after 5s..." -Icon '[RETRY]'
             Start-Sleep -Seconds 5
@@ -851,9 +1082,33 @@ To use a different port:
     # first to avoid "Non-resolvable import POM" and dependency resolution
     # errors when the mock-site module boots.
     #
-    # On a cold machine this step takes ~10-15 minutes.  Subsequent runs
-    # are near-instant (Maven reuses the cached artifacts).
+    # On a cold machine this step takes ~10-15 minutes; subsequent runs are
+    # near-instant (Maven reuses the cached artifacts).  That cold run used to
+    # be ~13 minutes of silence — Maven ran with -q and only a per-phase
+    # banner was printed — so the phases now decide their verbosity from the
+    # cache state: cold ⇒ Maven's own module output is streamed, a heartbeat
+    # proves the process is alive while Maven is quiet, and everything is
+    # tee'd to a log file whose path is printed; warm ⇒ quiet and fast, with
+    # the same banners and exit codes as before.
     if (-not $script:DryRun) {
+        $artifactVersion = ''
+        $versionFile = Join-Path $repoRoot 'VERSION'
+        if (Test-Path -LiteralPath $versionFile -PathType Leaf) {
+            $artifactVersion = ([string](Get-Content -LiteralPath $versionFile -TotalCount 1)).Trim()
+        }
+        $mavenLocalRepo = Get-MavenLocalRepositoryPath -RepoRoot $repoRoot
+        $preflightCache = Test-MavenPreflightCacheState -LocalRepo $mavenLocalRepo -Version $artifactVersion
+        $coldPreflight = -not ($preflightCache.BomCached -and $preflightCache.RestCached)
+
+        Write-Host ''
+        if ($coldPreflight) {
+            Write-Host 'Preflight: cold Maven cache — the first install can take 10-15 minutes; every later run takes seconds.' -ForegroundColor Yellow
+            Write-Host "  Local Maven repository: $mavenLocalRepo" -ForegroundColor DarkGray
+            Write-Host '  Maven output is streamed below, with a heartbeat while it is quiet, and tee''d to a log file per phase (path printed with the phase) — tail that file to follow progress.' -ForegroundColor DarkGray
+        } else {
+            Write-Host "Preflight: browser4-dependencies and browser4-rest already cached in $mavenLocalRepo — this should take seconds." -ForegroundColor DarkGray
+        }
+
         # Phase 1: dependency BOM (fast — POM only, no compilation)
         $preflightBomArgs = @(
             'install',
@@ -862,8 +1117,11 @@ To use a different port:
             '-DskipTests',
             '-q'
         )
-        Invoke-CommandAndReport -ScriptBlock { & $mvnwScript @preflightBomArgs } `
-            -Label 'InstallDependencyBOM' -PreExecPath $repoRoot
+        $preflightBomLog = Join-Path $script:TestLogDir 'mock-site-preflight-install-dependencies.log'
+        Invoke-CommandAndReport -ScriptBlock {
+            $global:LASTEXITCODE = Invoke-MavenInstallPhase -Label 'InstallDependencyBOM' `
+                -MvnArgs $preflightBomArgs -LogPath $preflightBomLog -ShowMavenOutput:$coldPreflight
+        } -Label 'InstallDependencyBOM' -PreExecPath $repoRoot
 
         # Phase 2: browser4-rest + transitive deps (slow on first build —
         #          browser4-rest compiles ~25 modules; 10-15 min cold).
@@ -876,7 +1134,9 @@ To use a different port:
             '-DskipTests',
             '-q'
         )
-        Invoke-KotlinCompileWithRetry -Label 'InstallBrowser4Rest' -PreExecPath $repoRoot -MvnArgs $preflightRestArgs
+        $preflightRestLog = Join-Path $script:TestLogDir 'mock-site-preflight-install-rest.log'
+        Invoke-KotlinCompileWithRetry -Label 'InstallBrowser4Rest' -PreExecPath $repoRoot `
+            -MvnArgs $preflightRestArgs -LogFile $preflightRestLog -ShowMavenOutput:$coldPreflight
     }
 
     # 'package spring-boot:run' compiles Kotlin (browser4-rest-tests and its
@@ -2708,6 +2968,11 @@ function Invoke-ChildProcessStreaming {
         Base heartbeat interval (progressive backoff is applied).  0 disables
         heartbeats.
 
+    .PARAMETER TailSize
+        Number of trailing output lines kept in memory.  Callers that inspect
+        the output for a marker (e.g. the Kotlin daemon retry) need a larger
+        tail than the default heartbeat-sized ring buffer.
+
     .PARAMETER DrainTimeoutSec
         Maximum seconds to wait for the child's stdout/stderr pipes to reach
         EOF after the child exited.  Descendants that inherited those pipes
@@ -2717,7 +2982,7 @@ function Invoke-ChildProcessStreaming {
 
     .OUTPUTS
         Hashtable with ExitCode, DurationSec, LogFile, OutputLines,
-        StderrLines, OutputChars, ConsoleWriteFailures and ChildPid.
+        StderrLines, OutputChars, ConsoleWriteFailures, ChildPid and TailLines.
     #>
     param(
         [Parameter(Mandatory = $true)] [string] $FilePath,
@@ -2725,6 +2990,7 @@ function Invoke-ChildProcessStreaming {
         [string] $WorkingDirectory = '',
         [string] $LogFile = '',
         [int] $HeartbeatSeconds = 20,
+        [int] $TailSize = 10,
         [double] $DrainTimeoutSec = 10
     )
 
@@ -2763,7 +3029,7 @@ function Invoke-ChildProcessStreaming {
     try {
         if ($relayAvailable) {
             # ── Primary path: capture through .NET pipes -------------------
-            $relay = [B4ChildOutputRelay]::new($logPath, 10)
+            $relay = [B4ChildOutputRelay]::new($logPath, $TailSize)
             $stdoutHandler = [Delegate]::CreateDelegate(
                 [System.Diagnostics.DataReceivedEventHandler], $relay, 'OnStdout')
             $stderrHandler = [Delegate]::CreateDelegate(
@@ -2902,6 +3168,9 @@ function Invoke-ChildProcessStreaming {
         OutputChars = if ($relay) { $relay.Chars } else { 0 }
         ConsoleWriteFailures = if ($relay) { $relay.ConsoleWriteFailures } else { 0 }
         ChildPid    = $childPid
+        # Trailing lines for callers that match a marker in the output (the
+        # Kotlin daemon retry); empty when the relay could not be compiled.
+        TailLines   = if ($relay) { @($relay.GetTail()) } else { @() }
     }
 
     if ($proc) { $proc.Dispose() }
@@ -4761,7 +5030,9 @@ if ($psTests.Count -gt 0) {
 }
 
 if ($launchTargets.Count -gt 0) {
-    Invoke-MockSiteBoot -additionalArgs $additionalArgs
+    # Discard the phase's exit code: every phase already reported [PASS]/[FAIL]
+    # and exited on failure, and a bare `0` on stdout is noise.
+    $null = Invoke-MockSiteBoot -additionalArgs $additionalArgs
 }
 
 # -- Report where this run's artifacts landed -------------------------
