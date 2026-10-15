@@ -38,7 +38,7 @@ use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
 
 use base64::Engine;
-use chrono::{Local, Utc};
+use chrono::{DateTime, Local, Utc};
 use reqwest::Client;
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::{json, Value};
@@ -98,7 +98,7 @@ const CLI_SELF_UPGRADE_SKIP_ENV: &str = "BROWSER4_CLI_SKIP_SELF_UPGRADE";
 // JSON output support (--json global flag)
 // ---------------------------------------------------------------------------
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 thread_local! {
     /// When `--json` is active, handlers write structured fields here instead
@@ -567,6 +567,7 @@ fn no_snapshot_commands() -> HashSet<&'static str> {
         "network-request",
         "network-route",
         "network-unroute",
+        "network-routes",
         "har-start",
         "har-stop",
         "webdb-export",
@@ -1360,6 +1361,11 @@ async fn post_command_snapshot(client: &Client, base_url: &str, session_id: &str
             (Ok(u), Ok(t), Ok(s)) => (u, t, s),
             _ => return, // silently ignore failures (e.g. session just closed)
         };
+
+        // A snapshot that captured interactive nodes disproves the "implausibly
+        // empty page" heuristic — remember it so the block advisory cannot fire
+        // on a page whose controls were just listed.
+        record_snapshot_interactive_nodes(&snap_result);
 
         // Auto-snapshots are tagged with an `auto-` filename prefix so that
         // `snapshot --auto-diff` skips them when picking the diff baseline
@@ -2758,17 +2764,23 @@ async fn handle_open(
                     }
 
                     if state.found_browser && !state.headed_browser {
+                        // The probe enumerates every Browser4-managed chrome in
+                        // this workspace; it cannot be scoped to the session that
+                        // was just created, so the wording must not assert that
+                        // *this* session is headless — another session's headless
+                        // browser produces exactly this result (reported as a
+                        // false "running HEADLESS" warning on a headed launch).
                         cli_println!(
-                            "⚠  No visible Browser4 window: Browser4-managed browsers are running HEADLESS even though this new session was started with --headed."
+                            "⚠  Could not confirm a visible window for this --headed session: every Browser4-managed browser detected for this workspace is running HEADLESS."
                         );
                         cli_println!(
-                            "   The browser is functional, but no window will appear. Close it with 'close'"
+                            "   The browser is functional, but it may have no window. Close it with 'close'"
                         );
                         cli_println!(
-                            "   and retry 'open --headed' once; if this persists it is a display-mode bug."
+                            "   and retry 'open --headed' once; if the window is still missing it is a display-mode bug."
                         );
                         cli_println!(
-                            "   (Detection is machine-wide: every PULSAR_CHROME browser is counted, so other sessions can skew this result.)"
+                            "   (Detection is machine-wide and cannot be scoped to this session, so this is a hint — another session's headless browser can produce it.)"
                         );
                     } else if state.headed_browser && !state.headed_window_visible {
                         cli_println!(
@@ -2864,12 +2876,30 @@ async fn handle_goto(
                 cli_println!("{}", result);
             }
             if was_already_at_url {
-                cli_println!("Already at {} — page unchanged.", target_url);
+                // The navigation was dispatched either way: `goto` is a
+                // navigation, not a "go there if not already there", so the page
+                // reloads.  The message used to claim "page unchanged", which
+                // contradicted the reload the caller had just triggered (and any
+                // server-side effect it caused).
+                cli_println!("Already at {} — reloaded the page.", target_url);
             } else {
                 // Detect redirects: compare the final URL with the requested URL
                 let final_url = current_session_url(client, base_url, session_name)
                     .await
                     .unwrap_or_else(|_| target_url.to_string());
+                // A committed chrome-error interstitial is a failure even though
+                // the navigation tool call returned success.
+                if let Some(message) = chrome_error_navigation_error(
+                    client,
+                    base_url,
+                    &session_id,
+                    target_url,
+                    &final_url,
+                )
+                .await
+                {
+                    return Err(message);
+                }
                 if !urls_match_for_display(&final_url, target_url) {
                     cli_println!(
                         "Navigated to {} (redirected from {})",
@@ -2915,6 +2945,17 @@ async fn handle_goto(
                     let final_url = current_session_url(client, base_url, session_name)
                         .await
                         .unwrap_or_else(|_| target_url.to_string());
+                    if let Some(message) = chrome_error_navigation_error(
+                        client,
+                        base_url,
+                        &retry_id,
+                        target_url,
+                        &final_url,
+                    )
+                    .await
+                    {
+                        return Err(message);
+                    }
                     if !urls_match_for_display(&final_url, target_url) {
                         cli_println!(
                             "Navigated to {} (redirected from {})",
@@ -3017,6 +3058,117 @@ fn format_navigation_failure_message(
     message.push("🧾 Details".to_string());
     message.push(format!("  {error}"));
     message.join("\n")
+}
+
+/// True when the browser landed on its own error interstitial rather than the
+/// requested document.
+///
+/// Offline emulation, an unresolvable host or a refused connection all make
+/// Chrome commit `chrome-error://chromewebdata/` while the navigation tool call
+/// itself still succeeds.
+fn is_chrome_error_url(url: &str) -> bool {
+    url.trim().to_ascii_lowercase().starts_with("chrome-error://")
+}
+
+/// JavaScript that reads a Chrome error interstitial: its title, its visible
+/// text and the `ERR_*` code Chrome prints there.  Best effort — the probe is
+/// allowed to come back empty and the message then omits those lines.
+const BROWSER_ERROR_PROBE_JS: &str = r#"(function(){
+var text='';
+try{text=(document.body&&typeof document.body.innerText==='string')?document.body.innerText:''}catch(e){}
+var title=String(document.title||'');
+var hit=(title+'\n'+text).match(/ERR_[A-Z_]{3,}/);
+return JSON.stringify({title:title,text:text.replace(/\s+/g,' ').trim().slice(0,300),code:hit?hit[0]:''});
+})()"#;
+
+/// Human message for a navigation that landed on the browser's error page.
+///
+/// The command must not print "Page loaded." for these: the requested document
+/// never rendered, so the caller would read a blank error page as content.
+fn format_browser_error_page_message(
+    target_url: &str,
+    error_url: &str,
+    code: Option<&str>,
+    title: Option<&str>,
+    text: Option<&str>,
+) -> String {
+    let mut lines = vec![
+        "❌ Navigation failed: the browser showed its error page instead of the requested document."
+            .to_string(),
+        format!("  URL: {target_url}"),
+        format!("  Landed on: {error_url}"),
+    ];
+    if let Some(code) = code.filter(|c| !c.is_empty()) {
+        lines.push(format!("  Browser error: {code}"));
+    }
+    if let Some(title) = title.filter(|t| !t.trim().is_empty()) {
+        lines.push(format!("  Page title: {}", title.trim()));
+    }
+    if let Some(text) = text.filter(|t| !t.trim().is_empty()) {
+        lines.push(format!("  Page text: {}", text.trim()));
+    }
+    lines.push(String::new());
+    lines.push("💡 What to try".to_string());
+    lines.push(
+        "  - verify the URL and the network: offline emulation and aborted routes render this page."
+            .to_string(),
+    );
+    lines.push(format!(
+        "  - restore the network (re-enable any offline emulation or aborted route), then re-run `{} goto <url>`.",
+        cli_binary_name()
+    ));
+    lines.join("\n")
+}
+
+/// Turn a navigation that landed on `chrome-error://chromewebdata/` into a hard
+/// failure, surfacing the page's own error text when the probe can read it.
+async fn chrome_error_navigation_error(
+    client: &Client,
+    base_url: &str,
+    session_id: &str,
+    target_url: &str,
+    final_url: &str,
+) -> Option<String> {
+    if !is_chrome_error_url(final_url) {
+        return None;
+    }
+    let probe = call_tool(
+        client,
+        base_url,
+        "browser_evaluate",
+        json!({ "sessionId": session_id, "expression": BROWSER_ERROR_PROBE_JS }),
+    )
+    .await
+    .ok()
+    .and_then(|result| parse_probe_json(&result));
+    let code = probe
+        .as_ref()
+        .and_then(|p| p.get("code"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let title = probe
+        .as_ref()
+        .and_then(|p| p.get("title"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let text = probe
+        .as_ref()
+        .and_then(|p| p.get("text"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    json_field("landed_url", json!(final_url));
+    json_field("navigation_failed", json!(true));
+    if !code.is_empty() {
+        json_field("browser_error_code", json!(code));
+    }
+    Some(format_browser_error_page_message(
+        target_url,
+        final_url,
+        Some(code),
+        Some(title),
+        Some(text),
+    ))
 }
 
 /// Handle the `click`, `dblclick`, and `press` commands.
@@ -4402,7 +4554,7 @@ async fn handle_kill_all() -> Result<(), String> {
 
     let result = stop_browser4_server_forcibly();
     let shutdown_result = result.shutdown;
-    finalize_global_cleanup("Killed", &shutdown_result);
+    finalize_global_cleanup("Killed", &shutdown_result, false);
 
     // JSON fields
     {
@@ -4574,6 +4726,446 @@ async fn current_session_url(
     call_session_tool(client, base_url, session_name, "current_url", json!({})).await
 }
 
+/// The `scheme://host[:port]` part of [url], or None when it has no authority.
+///
+/// Only `http`/`https` are accepted: the geolocation permission is scoped to a
+/// web origin, so a browser-internal page (`chrome-error://chromewebdata/`,
+/// `about:blank`, `devtools://…`) has no origin a permission could be granted
+/// for — reporting that is better than granting the permission to a fake host.
+/// Passing a full URL (with its path) to `Browser.grantPermissions` grants
+/// nothing, which is the other reason this strips everything after the authority.
+fn url_origin(url: &str) -> Option<String> {
+    let trimmed = url.trim();
+    let scheme_end = trimmed.find("://")?;
+    let scheme = trimmed[..scheme_end].to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    let rest = &trimmed[scheme_end + 3..];
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    if authority.is_empty() {
+        return None;
+    }
+    Some(format!("{}://{}", scheme, authority))
+}
+
+/// Describe the CDP call a `set <mode>` invocation is about to issue, in the
+/// terms the user typed — so a successful `set` reports what was applied instead
+/// of the CDP call's empty result object.
+///
+/// Returns None for a method this command does not build, which lets the caller
+/// fall back to naming the mode rather than inventing a description.
+fn describe_cdp_application(tool_params: &Value) -> Option<String> {
+    let method = tool_params.get("method").and_then(|v| v.as_str())?;
+    let params = tool_params.get("params");
+    let number = |key: &str| {
+        params
+            .and_then(|p| p.get(key))
+            .and_then(|v| v.as_f64())
+            .map(|v| if v.fract() == 0.0 { format!("{}", v as i64) } else { format!("{v}") })
+            .unwrap_or_else(|| "?".to_string())
+    };
+    let flag = |key: &str| {
+        params
+            .and_then(|p| p.get(key))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    };
+    Some(match method {
+        "Emulation.setGeolocationOverride" => format!(
+            "Geolocation emulated: latitude={}, longitude={}, accuracy={} m",
+            number("latitude"),
+            number("longitude"),
+            number("accuracy")
+        ),
+        "Network.emulateNetworkConditions" => format!(
+            "Network emulation: offline={}",
+            if flag("offline") { "on" } else { "off" }
+        ),
+        "Network.setExtraHTTPHeaders" => {
+            let count = params
+                .and_then(|p| p.get("headers"))
+                .and_then(|v| v.as_object())
+                .map(|map| map.len())
+                .unwrap_or(0);
+            format!("Extra HTTP headers set: {} header(s)", count)
+        }
+        "Emulation.setEmulatedMedia" => {
+            let features = params
+                .and_then(|p| p.get("features"))
+                .and_then(|v| v.as_array())
+                .map(|list| {
+                    list.iter()
+                        .filter_map(|f| {
+                            let name = f.get("name")?.as_str()?;
+                            let value = f.get("value")?.as_str()?;
+                            Some(format!("{name}={value}"))
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            if features.is_empty() {
+                "Media emulation applied".to_string()
+            } else {
+                format!("Media emulation applied: {features}")
+            }
+        }
+        "Emulation.setDeviceMetricsOverride" => format!(
+            "Device metrics emulated: {}x{} @dpr {}, mobile={} (device metrics are dropped by \
+             `goto` and `resize`)",
+            number("width"),
+            number("height"),
+            number("deviceScaleFactor"),
+            flag("mobile")
+        ),
+        _ => return None,
+    })
+}
+
+
+/// Count the entries in a `network requests` result, for the pre-clear reading.
+fn count_network_entries(raw: &str) -> usize {
+    let Ok(value) = serde_json::from_str::<Value>(raw.trim()) else {
+        return 0;
+    };
+    match &value {
+        Value::Array(list) => list.len(),
+        Value::Object(map) => map
+            .get("requests")
+            .or_else(|| map.get("entries"))
+            .and_then(|v| v.as_array())
+            .map(Vec::len)
+            .unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// Render a `network requests` result as a compact table.
+///
+/// The tool answers with the full tracked buffer as JSON — headers included — and
+/// printing that verbatim dumped tens of kilobytes for one command, with no way
+/// to see the shape of the traffic.  The table keeps one line per request
+/// (status, method, type, URL); `--json` still prints the raw payload, and a
+/// result that is not JSON is passed through unchanged.
+///
+/// [limit] keeps only the newest N rows (the header always reports the totals, so
+/// a truncated view cannot be mistaken for the whole buffer).
+fn render_network_requests(raw: &str, limit: Option<usize>) -> String {
+    let text = raw.trim();
+    if text.is_empty() {
+        return "No network requests tracked yet.".to_string();
+    }
+    let Ok(value) = serde_json::from_str::<Value>(text) else {
+        return text.to_string();
+    };
+    let entries: Vec<&Value> = match &value {
+        Value::Array(list) => list.iter().collect(),
+        Value::Object(map) => map
+            .get("requests")
+            .or_else(|| map.get("entries"))
+            .and_then(|v| v.as_array())
+            .map(|list| list.iter().collect())
+            .unwrap_or_default(),
+        _ => return text.to_string(),
+    };
+    if entries.is_empty() {
+        return "No network requests tracked yet (tracking starts at navigation).".to_string();
+    }
+
+    let field = |entry: &Value, keys: &[&str]| -> String {
+        for key in keys {
+            if let Some(value) = entry.get(*key) {
+                match value {
+                    Value::String(text) => return text.clone(),
+                    Value::Number(number) => return number.to_string(),
+                    Value::Null => {}
+                    other => return other.to_string(),
+                }
+            }
+        }
+        String::new()
+    };
+
+    let total = entries.len();
+    let shown: Vec<&Value> = match limit {
+        Some(n) if n < total => entries[total - n..].to_vec(),
+        _ => entries,
+    };
+    let mut lines = Vec::with_capacity(shown.len() + 1);
+    lines.push(format!(
+        "Network requests: {} tracked{}:",
+        total,
+        if shown.len() < total {
+            format!(", showing the newest {}", shown.len())
+        } else {
+            String::new()
+        }
+    ));
+    for entry in shown {
+        let status = field(entry, &["status", "statusCode", "responseStatus"]);
+        let method = field(entry, &["method", "requestMethod"]);
+        let kind = field(entry, &["resourceType", "type"]);
+        let url = field(entry, &["url", "requestUrl"]);
+        let id = field(entry, &["requestId", "id"]);
+        let url = if url.chars().count() > 96 {
+            format!("{}…", url.chars().take(96).collect::<String>())
+        } else {
+            url
+        };
+        let mut line = format!(
+            "{:>4}  {:<6} {:<7} {}",
+            if status.is_empty() { "-" } else { &status },
+            if method.is_empty() { "-" } else { &method },
+            if kind.is_empty() { "-" } else { &kind },
+            url
+        );
+        if !id.is_empty() {
+            line.push_str(&format!("  [{}]", id));
+        }
+        lines.push(line);
+    }
+    lines.push("Full headers and bodies: `network request <id>` (id in brackets) or --json.".to_string());
+    lines.join("\n")
+}
+
+
+///
+/// The tool answers with `List<FrameInfo>` as JSON; printing that verbatim made
+/// the command's only documentation (an indented tree in `references/frames.md`)
+/// describe output the command never produced.  A result that is not JSON is
+/// passed through unchanged — a rendering convenience must never hide the real
+/// payload.
+/// Render the `network routes` result as a table.
+///
+/// The entries carry the same shape `network route` reports, so the action column
+/// is the point: an `abort` route and a mock `body` route were previously
+/// indistinguishable in the output, and there was no listing at all.
+fn render_network_routes(raw: &str) -> String {
+    let text = raw.trim();
+    if text.is_empty() {
+        return "No request routes are registered on this tab.".to_string();
+    }
+    let Ok(value) = serde_json::from_str::<Value>(text) else {
+        return text.to_string();
+    };
+    let routes: Vec<Value> = match &value {
+        Value::Array(list) => list.clone(),
+        Value::Object(map) => map
+            .get("routes")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default(),
+        _ => return text.to_string(),
+    };
+    if routes.is_empty() {
+        return "No request routes are registered on this tab.".to_string();
+    }
+
+    let mut lines = Vec::with_capacity(routes.len() + 2);
+    lines.push(format!("Request routes ({} registered):", routes.len()));
+    for route in &routes {
+        let pattern = route
+            .get("pattern")
+            .or_else(|| route.get("urlPattern"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let action = route
+            .get("action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("route");
+        let content_type = route
+            .get("contentType")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let types = route
+            .get("resourceTypes")
+            .and_then(|v| v.as_array())
+            .map(|list| {
+                list.iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .unwrap_or_default();
+        let mut line = format!("{:<6} {}", action, pattern);
+        if !content_type.is_empty() {
+            line.push_str(&format!("  [mock: {content_type}]"));
+        }
+        if !types.is_empty() {
+            line.push_str(&format!("  [types: {types}]"));
+        }
+        lines.push(line);
+    }
+    lines.push(
+        "Remove one with `network unroute <pattern>` (or all of them with `network unroute`)."
+            .to_string(),
+    );
+    lines.join("\n")
+}
+
+fn render_frame_tree(raw: &str) -> String {
+    let text = raw.trim();
+    if text.is_empty() {
+        return "No frames reported (the page has no iframes).".to_string();
+    }    let Ok(value) = serde_json::from_str::<Value>(text) else {
+        return text.to_string();
+    };
+    let frames: Vec<Value> = match &value {
+        Value::Array(list) => list.clone(),
+        Value::Object(map) => map
+            .get("frames")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default(),
+        _ => return text.to_string(),
+    };
+    if frames.is_empty() {
+        return "No frames reported (the page has no iframes).".to_string();
+    }
+
+    let mut lines = Vec::with_capacity(frames.len() + 1);
+    lines.push("Frames (depth-first; `[active]` is the scope element commands resolve in):".to_string());
+    for frame in &frames {
+        let depth = frame
+            .get("depth")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+            .max(0) as usize;
+        let name = frame.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let url = frame.get("url").and_then(|v| v.as_str()).unwrap_or("");
+        let id = frame.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        let parent = frame.get("parentId").and_then(|v| v.as_str());
+        let active = frame.get("active").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        let mut line = "  ".repeat(depth);
+        line.push_str(if parent.is_none() { "- " } else { "└ " });
+        line.push_str(if name.is_empty() { "(unnamed)" } else { name });
+        if active {
+            line.push_str(" [active]");
+        }
+        if !url.is_empty() {
+            line.push_str(&format!(" — {url}"));
+        }
+        if !id.is_empty() {
+            line.push_str(&format!(" (id={id})"));
+        }
+        lines.push(line);
+    }
+    lines.join("\n")
+}
+
+/// Describe the frame scope a `frame <target>` switch landed in, from the
+/// `frame_switch` result.  None when the result does not carry a frame (the
+/// caller then falls back to the target the user typed).
+fn describe_frame_scope(raw: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(raw.trim()).ok()?;
+    let frame = match &value {
+        Value::Object(map) => map.get("frame").unwrap_or(&value),
+        _ => &value,
+    };
+    let name = frame.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let url = frame.get("url").and_then(|v| v.as_str()).unwrap_or("");
+    let id = frame.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    let label = if !name.is_empty() {
+        name.to_string()
+    } else if !url.is_empty() {
+        url.to_string()
+    } else if !id.is_empty() {
+        format!("id={id}")
+    } else {
+        return None;
+    };
+    Some(if url.is_empty() || label == url {
+        label
+    } else {
+        format!("{label} — {url}")
+    })
+}
+
+
+///
+/// These read the page and print a verdict; `--fail-on-false` turns that verdict
+/// into the exit code (see the dispatch arm).
+fn is_assertion_command(command: &str) -> bool {
+    matches!(command, "is-visible" | "is-enabled" | "is-checked")
+}
+
+/// The verdict of an assertion tool result: `Some(true)`/`Some(false)` for a
+/// boolean, `None` when the backend did not answer with one.
+///
+/// The result travels as text, so both the JSON boolean form (`true`) and the
+/// legacy quoted form (`"true"`) are accepted, exactly like the tab-entry
+/// parsing elsewhere in this file.  A missing element answers `null` (or an empty
+/// response) — that is *not* `false` and it is not a pass either, so it stays
+/// `None` and `--fail-on-false` fails on it.
+fn parse_assertion_verdict(raw: &str) -> Option<bool> {
+    let text = raw.trim();
+    if text.is_empty() {
+        return None;
+    }
+    match serde_json::from_str::<Value>(text) {
+        Ok(Value::Bool(value)) => Some(value),
+        Ok(Value::String(value)) => parse_assertion_verdict(&value),
+        // A JSON envelope (e.g. {"result":false}) — read the value out of it.
+        Ok(Value::Object(map)) => map.get("result").and_then(|v| match v {
+            Value::Bool(value) => Some(*value),
+            Value::String(value) => parse_assertion_verdict(value),
+            _ => None,
+        }),
+        Ok(Value::Null) => None,
+        _ => match text.to_ascii_lowercase().as_str() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        },
+    }
+}
+
+
+/// True when [tool_params] is the CDP payload `set geo` produces.
+///
+/// Keyed on the CDP method rather than on the `mode` argument so the grant
+/// cannot drift from the command it accompanies.
+fn is_geolocation_override(tool_params: &Value) -> bool {
+    tool_params.get("method").and_then(|v| v.as_str()) == Some("Emulation.setGeolocationOverride")
+}
+
+/// Grant the geolocation permission for the session's current page origin.
+///
+/// `set geo` installs `Emulation.setGeolocationOverride`, but Chrome gates
+/// `navigator.geolocation.getCurrentPosition()` on the geolocation *permission*:
+/// without a grant for the page's origin the override is invisible to page
+/// script and the caller's promise never settles — the command reports success
+/// while the emulation does nothing observable.
+///
+/// The origin lives with the session, so it can only be read here; the params
+/// builder cannot see the current URL.
+///
+/// @return the origin the permission was granted for.
+/// @throws String when the origin cannot be read or derived — the caller reports
+///   that instead of silently pretending the emulation is observable.
+async fn grant_geolocation_permission(
+    client: &Client,
+    base_url: &str,
+    session_name: Option<&str>,
+) -> Result<String, String> {
+    let url = current_session_url(client, base_url, session_name).await?;
+    let origin = url_origin(&url).ok_or_else(|| {
+        format!("the session's current URL '{url}' has no origin to grant the permission for")
+    })?;
+    call_session_tool(
+        client,
+        base_url,
+        session_name,
+        "execute_cdp_command",
+        commands::geolocation_grant_params(&origin),
+    )
+    .await?;
+    Ok(origin)
+}
+
 fn storage_area_label(storage_area: &str) -> &'static str {
     match storage_area {
         "localStorage" => "localStorage",
@@ -4703,8 +5295,31 @@ async fn close_all_sessions_across_servers(client: &Client, base_url: &str) -> C
     summary
 }
 
-fn finalize_global_cleanup(action: &str, result: &ShutdownResult) {
-    clear_all_state(None);
+/// Finish a whole-instance shutdown: clean up the persisted session state and
+/// report what was stopped.
+///
+/// [keep_sessions] decides what happens to the session records:
+///
+/// - `false` (kill-all, close-all): the sessions are gone with the browser, so
+///   their records are deleted and they disappear from `list`.
+/// - `true` (`stop`): the *backend* was stopped, not the sessions.  Deleting the
+///   records made sessions vanish from `list` even though the live browser and the
+///   saved state were still there — the documented "Stale / Refresh" listing flow
+///   had nothing left to list.  The records are marked stale instead, so `list`
+///   can show them and `goto`/`open` can revive them.
+fn finalize_global_cleanup(action: &str, result: &ShutdownResult, keep_sessions: bool) {
+    if keep_sessions {
+        let marked = state::mark_all_sessions_stale(None);
+        if marked > 0 {
+            cli_println!(
+                "Marked {} session record(s) stale — they stay in `list` and are revived by \
+                 `open`/`goto` after the backend restarts.",
+                marked
+            );
+        }
+    } else {
+        clear_all_state(None);
+    }
     log_shutdown_result(action, result);
 }
 
@@ -4956,8 +5571,9 @@ fn list_session_timestamps(
 struct SessionRow {
     name: String,
     session_id: String,
-    /// Current page URL from the backend record; "-" when unavailable
-    /// (backend unreachable, older backend, or a stale local session).
+    /// Current page URL: the backend record when it carries one, otherwise the
+    /// live tab's URL for Active sessions, `?` when even that cannot be read,
+    /// and "-" only when the backend is unreachable or the session is stale.
     url: String,
     status: String,
     display: String,
@@ -5208,17 +5824,24 @@ async fn handle_list(
     let namespaces = collect_state_namespaces(&current_dir, &global_dir, all);
     let scanned_namespaces = namespaces.len();
     let mut grouped: Vec<(StateNamespace, Vec<SessionRow>)> = Vec::new();
+    let mut url_unknown = false;
     for namespace in namespaces {
         let records = if namespace.is_current {
             backend_sessions.as_deref()
         } else {
             None
         };
-        let rows = collect_namespace_sessions(&namespace.dir, records);
+        let mut rows = collect_namespace_sessions(&namespace.dir, records);
         if rows.is_empty() {
             // Namespaces without persisted sessions are dropped so `--all`
             // does not drown the table in empty workspaces.
             continue;
+        }
+        // `list_sessions` does not always carry a page URL even for an Active
+        // session; the live tab still knows it, so ask before falling back to
+        // the "unreachable/stale" marker.
+        if namespace.is_current && backend_reachable {
+            url_unknown = resolve_live_session_urls(client, base_url, &mut rows).await || url_unknown;
         }
         grouped.push((namespace, rows));
     }
@@ -5341,11 +5964,95 @@ async fn handle_list(
     json_field("sessions", json!(json_sessions));
     json_field("backend_reachable", json!(backend_reachable));
 
+    if url_unknown {
+        // stderr on purpose: the legend must not pollute a piped `list --json`.
+        eprintln!("{}", session_url_unknown_note());
+    }
+
     if let Some(note) = backend_note {
         cli_println!("\n{}", note);
     }
 
     Ok(())
+}
+
+/// Marker for a live session whose page URL could not be determined.
+///
+/// Distinct from `-`, which the docs define as "backend unreachable or the
+/// saved session is stale" — an Active session must not reuse it just because
+/// the URL lookup failed.
+const SESSION_URL_UNKNOWN: &str = "?";
+
+/// One-line legend for [SESSION_URL_UNKNOWN], printed to stderr when it is used.
+fn session_url_unknown_note() -> String {
+    format!(
+        "Note: URL '{SESSION_URL_UNKNOWN}' = the session is live but its page URL could not be read; \
+         '-' means the backend is unreachable or the saved session is stale. \
+         Run 'page-info -s <name>' to query one session directly."
+    )
+}
+
+/// True when a row's URL must be resolved from the live session: the backend
+/// record had none, and the session is demonstrably Active.
+fn row_needs_live_url(row: &SessionRow) -> bool {
+    row.url == "-" && row.status == "Active"
+}
+
+/// Trim a `current_url` payload to a printable URL.
+///
+/// Returns an empty string when the payload carries no usable URL, so callers
+/// can fall back to [SESSION_URL_UNKNOWN] instead of printing `null` or `-`.
+fn normalize_live_url(raw: &str) -> String {
+    let trimmed = raw.trim();
+    // Some transports JSON-encode the string value.
+    let unquoted = trimmed
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .unwrap_or(trimmed)
+        .trim();
+    if unquoted.is_empty()
+        || unquoted.eq_ignore_ascii_case("null")
+        || unquoted.eq_ignore_ascii_case("undefined")
+        || unquoted == "-"
+    {
+        String::new()
+    } else {
+        unquoted.to_string()
+    }
+}
+
+/// Fill in the live page URL for Active rows whose backend record had none.
+///
+/// Returns true when at least one Active row's URL stayed unknown, so the
+/// caller can print the marker legend.
+async fn resolve_live_session_urls(
+    client: &Client,
+    base_url: &str,
+    rows: &mut [SessionRow],
+) -> bool {
+    let mut any_unknown = false;
+    for row in rows.iter_mut() {
+        if !row_needs_live_url(row) {
+            continue;
+        }
+        // `(default)` is the unnamed session — `with_session(None)` resolves it.
+        let session_name = if row.name == "(default)" {
+            None
+        } else {
+            Some(row.name.as_str())
+        };
+        let live_url = current_session_url(client, base_url, session_name)
+            .await
+            .map(|raw| normalize_live_url(&raw))
+            .unwrap_or_default();
+        if live_url.is_empty() {
+            row.url = SESSION_URL_UNKNOWN.to_string();
+            any_unknown = true;
+        } else {
+            row.url = live_url;
+        }
+    }
+    any_unknown
 }
 
 /// Count locally-tracked sessions the same way `handle_list` does:
@@ -5883,8 +6590,28 @@ fn normalize_cookie_for_display(cookie: &Value) -> Value {
             }
         }
     }
+    // Emit the full attribute set with explicit nulls.  The backend omits what a
+    // cookie does not carry (a session cookie has no `expires`, an unspecified
+    // `sameSite` is absent), which made the CLI's own JSON an optional-key schema:
+    // a consumer could not tell "the browser did not report it" from "the CLI
+    // dropped it", and cookie-list and state-save disagreed about which keys
+    // exist.  Attributes the browser *does* report are left untouched — only
+    // missing ones are filled in, so nothing is lost.
+    for key in COOKIE_DISPLAY_KEYS {
+        normalized
+            .entry(key.to_string())
+            .or_insert(Value::Null);
+    }
     Value::Object(normalized)
 }
+
+/// The cookie attributes every `cookie-list` / `state-save` row carries.
+///
+/// A fixed key set is what makes two cookies comparable without the caller
+/// probing for key presence first; see [normalize_cookie_for_display].
+const COOKIE_DISPLAY_KEYS: [&str; 8] = [
+    "name", "value", "domain", "path", "expires", "httpOnly", "secure", "sameSite",
+];
 
 /// Deterministic ordering for cookie output: by domain, then path, then name.
 /// CDP's getAllCookies has no stable order between runs, so cookie-list and
@@ -6688,6 +7415,9 @@ async fn handle_snapshot(
         [u, t, s] => (*u, *t, *s),
         _ => ("", "", combined_result.text.as_str()),
     };
+    // A successful capture with interactive nodes is evidence that the page is
+    // real — the block advisory must not contradict its own snapshot.
+    record_snapshot_interactive_nodes(snap);
 
     // --stdout / --raw: print to stdout without persisting a snapshot file.
     // Previously the file was written unconditionally, which silently shifted
@@ -7475,6 +8205,60 @@ fn handle_profiles_list() -> Result<(), String> {
 /// `wait --download [--dir <path>] [--timeout <ms>]` — poll the download
 /// directory until no `.crdownload`/`.tmp` files remain and at least one
 /// completed file exists.
+/// Snapshot of a download directory: file name -> (size, last modification).
+type DownloadDirSnapshot = std::collections::HashMap<String, (u64, Option<std::time::SystemTime>)>;
+
+/// True for the temporary names a browser uses while a download is in flight.
+fn is_partial_download_name(name: &str) -> bool {
+    name.ends_with(".crdownload")
+        || name.ends_with(".tmp")
+        || name.ends_with(".part")
+        || name.ends_with(".download")
+}
+
+/// Files present in `dir` right now (name -> size + modification time).
+fn snapshot_download_dir(dir: &Path) -> DownloadDirSnapshot {
+    let mut snapshot = DownloadDirSnapshot::new();
+    if let Ok(iter) = std::fs::read_dir(dir) {
+        for entry in iter.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let meta = entry.metadata().ok();
+            let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+            let modified = meta.as_ref().and_then(|m| m.modified().ok());
+            snapshot.insert(name, (size, modified));
+        }
+    }
+    snapshot
+}
+
+/// Completed download files that appeared **or changed** since `before`.
+///
+/// `wait --download` used to treat "any non-temporary file exists" as success,
+/// so a directory holding an unrelated pre-existing file reported a completed
+/// download instantly — with no download in flight at all.  Only files that are
+/// new (or whose size/mtime changed) since the wait started count.
+fn new_or_changed_downloads(dir: &Path, before: &DownloadDirSnapshot) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    if let Ok(iter) = std::fs::read_dir(dir) {
+        for entry in iter.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if is_partial_download_name(&name) {
+                continue;
+            }
+            let meta = entry.metadata().ok();
+            let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+            let modified = meta.as_ref().and_then(|m| m.modified().ok());
+            match before.get(&name) {
+                // Pre-existing and untouched: not evidence of a download.
+                Some(previous) if *previous == (size, modified) => {}
+                _ => names.push(name),
+            }
+        }
+    }
+    names.sort();
+    names
+}
+
 async fn handle_wait_download(tool_params: &Value) -> Result<(), String> {
     use std::path::PathBuf;
 
@@ -7497,9 +8281,12 @@ async fn handle_wait_download(tool_params: &Value) -> Result<(), String> {
         ));
     }
 
+    // Baseline: only files that appear (or change) after this point can be the
+    // download being awaited.
+    let baseline = snapshot_download_dir(&dir_path);
+
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_millis);
     loop {
-        let mut has_completed_file = false;
         let mut downloading = false;
         if let Ok(iter) = std::fs::read_dir(&dir_path) {
             for entry in iter.flatten() {
@@ -7509,32 +8296,35 @@ async fn handle_wait_download(tool_params: &Value) -> Result<(), String> {
                     || name.ends_with(".part")
                 {
                     downloading = true;
-                } else if !name.ends_with(".download") {
-                    has_completed_file = true;
                 }
             }
         }
 
-        if has_completed_file && !downloading {
+        let completed = new_or_changed_downloads(&dir_path, &baseline);
+        if !completed.is_empty() && !downloading {
             cli_println!("Download complete in {}", dir_path.display());
-            let mut names: Vec<String> = std::fs::read_dir(&dir_path)
-                .map_err(|e| e.to_string())?
-                .filter_map(|e| e.ok())
-                .map(|e| e.file_name().to_string_lossy().to_string())
-                .collect();
-            names.sort();
-            for name in names {
+            for name in completed {
                 cli_println!("  {}", name);
             }
             return Ok(());
         }
 
         if std::time::Instant::now() >= deadline {
-            return Err(format!(
+            let pre_existing = baseline
+                .keys()
+                .filter(|name| !is_partial_download_name(name))
+                .count();
+            let mut message = format!(
                 "Timed out after {} ms waiting for a download in {}",
                 timeout_millis,
                 dir_path.display()
-            ));
+            );
+            if pre_existing > 0 {
+                message.push_str(&format!(
+                    " ({pre_existing} pre-existing file(s) in that directory do not count as a completed download)"
+                ));
+            }
+            return Err(message);
         }
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     }
@@ -7981,6 +8771,59 @@ fn eval_result_to_typed_json(result: &str) -> serde_json::Value {
     serde_json::from_str(result).unwrap_or_else(|_| serde_json::Value::String(result.to_string()))
 }
 
+/// True when an expression's empty result plausibly means "the page content it
+/// read is gone" (as opposed to "the script simply returned nothing").
+///
+/// The trigger needs `document.querySelector(` — the previous bare-substring
+/// test also matched `document.querySelectorAll(…)`, so the strongest hint
+/// ("the page may have changed… run `goto`") fired for the most common
+/// extraction snippet, on a page that was perfectly fine.
+fn expression_expects_page_content(expression: &str) -> bool {
+    expression.contains("document.title")
+        || expression.contains("document.body")
+        || expression.contains("document.querySelector(")
+        || expression.contains("document.querySelector (")
+}
+
+/// Shorten an expression for a one-line diagnostic.
+///
+/// `--file`/`--stdin` expressions are whole scripts; echoing one back verbatim
+/// buried the hint under dozens of lines the user had just written.
+fn summarize_expression_for_diagnostic(expression: &str) -> String {
+    let first_line = expression.lines().next().unwrap_or("").trim();
+    let mut compact: String = first_line.chars().take(120).collect();
+    if first_line.chars().count() > 120 || expression.lines().count() > 1 {
+        compact.push('…');
+    }
+    compact
+}
+
+/// True when this eval is the `pushstate` command's `history.pushState` call.
+fn is_pushstate_eval(tool_name: &str, tool_params: &Value) -> bool {
+    tool_name == "browser_evaluate"
+        && tool_params
+            .get("expression")
+            .and_then(|v| v.as_str())
+            .is_some_and(|expression| expression.contains("history.pushState("))
+}
+
+/// Error for a `pushstate` whose URL did not change.
+///
+/// The usual cause is a cross-origin target: `history.pushState` throws
+/// `SecurityError` for another origin, the eval returns null, and the entry is
+/// never created — so "nothing happened, exit 0" is the one outcome the user
+/// must not get.
+fn pushstate_failure_message(before: Option<&str>, after: Option<&str>) -> String {
+    let current = after.or(before).unwrap_or("<unknown>");
+    format!(
+        "history.pushState did not change the page URL (still {current}).\n\
+         A cross-origin URL throws SecurityError in the browser: pushState can only set a URL on \
+         the same origin as the current document (use `goto` for a full navigation instead).\n\
+         The URL is also unchanged when it is identical to the current one, or when the page \
+         cancelled the navigation."
+    )
+}
+
 /// True when `segment` is a valid JS identifier (option member name).
 fn is_js_identifier_segment(segment: &str) -> bool {
     let mut chars = segment.chars();
@@ -8084,6 +8927,16 @@ async fn handle_tool_command_with_options(
     session_name: Option<&str>,
     eval_json: bool,
 ) -> Result<(), String> {
+    // `pushstate` is an eval of `history.pushState(...)`: remember the current
+    // page URL so the push can be verified afterwards (a rejected cross-origin
+    // push leaves the URL unchanged and the eval null).
+    let is_pushstate = is_pushstate_eval(tool_name, tool_params);
+    let pushstate_before_url = if is_pushstate {
+        current_session_url(client, base_url, session_name).await.ok()
+    } else {
+        None
+    };
+
     let result = with_session(
         client,
         base_url,
@@ -8099,6 +8952,31 @@ async fn handle_tool_command_with_options(
         },
     )
     .await?;
+
+    // `pushstate` reaches the backend as an eval of `history.pushState(...)`.
+    // A cross-origin push throws SecurityError, the backend answers null, and
+    // the generic eval rendering used to print the property hint with exit 0 —
+    // the history entry was never created.  Verify the outcome against the URL
+    // captured before the call.
+    if let Some(before) = pushstate_before_url {
+        let after = current_session_url(client, base_url, session_name)
+            .await
+            .ok();
+        let changed = match &after {
+            Some(after) => !urls_match_for_display(&before, after),
+            None => false,
+        };
+        if !changed {
+            json_field("url", json!(after.clone().unwrap_or_default()));
+            json_field("pushstate_applied", json!(false));
+            return Err(pushstate_failure_message(Some(&before), after.as_deref()));
+        }
+        let landed = after.unwrap_or_default();
+        cli_println!("History entry pushed: {}", landed);
+        json_field("url", json!(landed));
+        json_field("pushstate_applied", json!(true));
+        return Ok(());
+    }
 
     // Null-aware output for eval: always print the result exactly once,
     // distinguishing JS null/undefined (which arrive as the literal string
@@ -8201,24 +9079,40 @@ async fn handle_tool_command_with_options(
             }
         } else if is_empty_result {
             if !json_active() {
-                eprintln!(
-                    "💡 Expression returned empty/undefined.\n\
-                       This could mean:\n\
-                       - The page context is stale (try: goto <url>)\n\
-                       - The JS expression returned undefined or \"\"\n\
-                       Check current page: eval \"window.location.href\""
-                );
-                // If the expression looked like it should produce output (e.g.
-                // `document.title`), offer a specific suggestion.
-                if expression.contains("document.title")
-                    || expression.contains("document.body")
-                    || expression.contains("document.querySelector")
-                {
+                if expression.contains("console.log") {
+                    // A "compute and console.log" script returns nothing; the
+                    // console buffer is a separate command.  Blaming the page
+                    // context here sent users re-navigating a perfectly good
+                    // page (reported as the wrong "page context is stale"
+                    // diagnosis), so the console cause is stated instead.
                     eprintln!(
-                        "   `{}` returned empty — the page may have changed\n\
-                           since your last navigation. Run `goto` first to restore the page context.",
-                        expression
+                        "💡 Expression returned empty/undefined.\n\
+                           The script calls console.log() but evaluates to no value — console.log output goes\n\
+                           to the page's console buffer, not to eval's return value.\n\
+                           End the script with `return` (or make the value the last expression) to see it here,\n\
+                           or read the captured buffer with `console` / `console --min-level`."
                     );
+                } else {
+                    eprintln!(
+                        "💡 Expression returned empty/undefined.\n\
+                           This could mean:\n\
+                           - The JS expression returned undefined or \"\"\n\
+                           - The page context is stale (try: goto <url>)\n\
+                           Check current page: eval \"window.location.href\""
+                    );
+                    // If the expression looked like it should produce output (e.g.
+                    // `document.title`), offer a specific suggestion.  The
+                    // trigger requires `document.querySelector(` — a bare
+                    // `document.querySelector` substring also matched
+                    // `querySelectorAll(…)` and fired the strongest hint for the
+                    // most common extraction snippet.
+                    if expression_expects_page_content(expression) {
+                        eprintln!(
+                            "   `{}` returned empty — the page may have changed\n\
+                               since your last navigation. Run `goto` first to restore the page context.",
+                            summarize_expression_for_diagnostic(expression)
+                        );
+                    }
                 }
             }
         }
@@ -8234,6 +9128,21 @@ async fn handle_tool_command_with_options(
             json_field("ref", json!(r));
         }
     } else if tool_name.starts_with("wait_") || tool_name == "delay" {
+        // A wait that timed out must not be reported as success: the backend
+        // encodes the outcome in its return value (negative code / null), so
+        // decoding it here is the difference between "page is ready" and
+        // "the condition never held".  Route the failure through the CLI error
+        // path so the exit code is non-zero and the envelope says "error".
+        if let WaitOutcome::TimedOut(code) = classify_wait_outcome(tool_name, &result) {
+            let message = wait_timeout_message(tool_name, tool_params);
+            json_field("result", json!(&result));
+            json_field("timedOut", json!(true));
+            json_field("tool", json!(tool_name));
+            if let Some(code) = code {
+                json_field("statusCode", json!(code));
+            }
+            return Err(message);
+        }
         // Wait tools return internal driver JSON — replace with user-friendly messages.
         // Always format even when the raw result is empty (e.g. `delay` returns "").
         let formatted = format_wait_result(tool_name, tool_params, &result);
@@ -8383,6 +9292,44 @@ fn looks_like_element_ref(selector: &str) -> bool {
     !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit())
 }
 
+/// The extraction mode implied by the backend tool name.
+///
+/// `get`'s tool_params carry no `mode` key — the mode is encoded in the MCP tool
+/// name (see `commands.rs`) — so reading only `mode` silently fell back to
+/// "text" and the attr/property diagnostics never ran on the real path.
+fn get_mode_from_tool_name(tool_name: &str) -> &'static str {
+    match tool_name {
+        "select_first_attribute_or_null" => "attr",
+        "select_first_property_value_or_null" => "property",
+        "bounding_box" => "box",
+        _ => "text",
+    }
+}
+
+/// Diagnostic lines for a `get` whose element matched but whose value is empty.
+///
+/// Per the documented value contract, `""` means "element matched, value empty"
+/// and only `null` means "no match" — so this path must never claim the
+/// selector matched nothing (that misdiagnosis made a present-but-empty field
+/// look unresolvable and sent users hunting for a different selector).
+fn get_matched_but_empty_diagnostic_lines(mode: &str, selector: &str, name: &str) -> Vec<String> {
+    let contract = "  Value contract: `\"\"` = element matched with an empty value; `null` = no match.";
+    match mode.to_ascii_lowercase().as_str() {
+        "attr" => vec![
+            format!("Element matched \"{selector}\" but the attribute '{name}' is empty or absent."),
+            contract.to_string(),
+        ],
+        "property" => vec![
+            format!("Element matched \"{selector}\" but the property '{name}' is empty."),
+            contract.to_string(),
+        ],
+        _ => vec![
+            format!("Element matched \"{selector}\" but its value is empty."),
+            contract.to_string(),
+        ],
+    }
+}
+
 /// Diagnostic lines printed when a `get` mode returned no value, refined per
 /// mode so the message matches what the user actually asked for:
 /// - attr/property modes: the backend cannot yet distinguish "element matched
@@ -8437,8 +9384,18 @@ async fn handle_get(
         .and_then(|v| v.as_str())
         .or_else(|| tool_params.get("ref").and_then(|v| v.as_str()))
         .unwrap_or(":root");
-    let mode = tool_params.get("mode").and_then(|v| v.as_str()).unwrap_or("text");
-    let name = tool_params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    // The mode is encoded in the tool name, not in `mode` (commands.rs sends
+    // only attrName/propName) — infer it so the diagnostics match the request.
+    let mode = tool_params
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| get_mode_from_tool_name(tool_name));
+    let name = tool_params
+        .get("name")
+        .and_then(|v| v.as_str())
+        .or_else(|| tool_params.get("attrName").and_then(|v| v.as_str()))
+        .or_else(|| tool_params.get("propName").and_then(|v| v.as_str()))
+        .unwrap_or("");
 
     let result = with_session(client, base_url, session_name, false, |session_id| {
         let client = client.clone();
@@ -8469,13 +9426,22 @@ async fn handle_get(
 
     // The MCP response serialises the tool result to a string.
     // A JSON `null` result arrives as the literal string "null".
-    // An empty-string result arrives as "".
+    // An empty-string result arrives as "" — the documented "matched, empty"
+    // case, which is NOT the same as "no element matched".
     // An empty array `[]` means no elements matched (get all variants).
-    let empty_result = result == "null" || result.is_empty() || result.trim() == "[]";
+    let no_match = result == "null" || result.trim() == "[]";
+    let matched_but_empty = !no_match && result.is_empty();
 
-    if empty_result {
+    if no_match {
         cli_println!("{}", result);
         for line in get_no_value_diagnostic_lines(mode, selector, name) {
+            cli_println!("{}", line);
+        }
+    } else if matched_but_empty {
+        // Render the value explicitly so an empty line is not read as "the
+        // command printed nothing" — then explain which case this is.
+        cli_println!("\"\"");
+        for line in get_matched_but_empty_diagnostic_lines(mode, selector, name) {
             cli_println!("{}", line);
         }
     } else {
@@ -8483,8 +9449,11 @@ async fn handle_get(
     }
 
     json_field("result", json!(&result));
-    if let Some(mode) = tool_params.get("mode").and_then(|v| v.as_str()) {
-        json_field("mode", json!(mode));
+    // Always report the mode the CLI actually applied (inferred from the tool
+    // name when the params do not carry one), so the envelope is self-describing.
+    json_field("mode", json!(mode));
+    if matched_but_empty {
+        json_field("empty", json!(true));
     }
     if let Some(sel) = tool_params.get("selector").and_then(|v| v.as_str()) {
         json_field("selector", json!(sel));
@@ -8667,6 +9636,16 @@ async fn handle_extract(
         // envelope, which already contains `extracted_content`) — printing
         // the payload here too would emit a second, schema-less JSON line.
         cli_println!("{}", content);
+        if extraction_empty {
+            // stdout stays pure JSON, but an empty extraction must not look
+            // like success: a pipeline piping `extract --stdout` into jq/CI
+            // otherwise proceeds on `{}` with exit 0.  The diagnostic and the
+            // non-zero exit live on the error channel.
+            return Err(empty_extraction_stdout_error(
+                &content,
+                &out_path.display().to_string(),
+            ));
+        }
     } else {
         cli_println!("### Page");
         cli_println!("- Page URL: {}", url);
@@ -8684,6 +9663,21 @@ async fn handle_extract(
         }
     }
     Ok(())
+}
+
+/// Error for `extract --stdout` when the LLM returned no data.
+///
+/// The raw payload stays on stdout (pure JSON for pipelines); this message goes
+/// to the error channel and makes the command exit non-zero, so an empty
+/// extraction is not read as a valid-but-empty document.
+fn empty_extraction_stdout_error(content: &str, artifact: &str) -> String {
+    let payload = content.trim();
+    let shown = if payload.is_empty() { "<empty>" } else { payload };
+    format!(
+        "Extraction produced no data — the model returned nothing for this page.\n\
+         stdout carries the empty payload ({shown}); the raw response is at {artifact}.\n\
+         Retry with a more specific instruction, or use `eval` / `htmlsnapshot get` for CSS-based extraction."
+    )
 }
 
 /// Unwrap a double-encoded extract envelope.
@@ -9095,12 +10089,15 @@ async fn handle_html_snapshot_capture(
                     }
                 };
 
-                // Build extras: box and weight
+                // Build extras: box and weight.  `weight=` rather than the
+                // historical `w=`: the bare letter was undocumented and read as a
+                // typo, while the value is exactly the element's visual-prominence
+                // weight (the same ranking the capture sorts by).
                 let mut extras: Vec<String> = Vec::new();
                 if !box_val.is_empty() {
                     extras.push(format!("box={}", box_val));
                 }
-                extras.push(format!("w={}", weight));
+                extras.push(format!("weight={}", weight));
 
                 let mut line = element_list_row_label(i + 1);
                 // Pad description to desc_width
@@ -9200,10 +10197,11 @@ async fn handle_html_snapshot_capture(
             eprintln!("     htmlsnapshot get text \"h1\"   # page heading");
         }
         eprintln!("     htmlsnapshot get all text \"a\" --limit 20  # link texts");
-        eprintln!("     htmlsnapshot get attr \"img[src]\" src --limit 20  # image URLs");
-        eprintln!("     htmlsnapshot get attr \"a[href]\" href --limit 20  # link URLs");
-        if image_count > 0 {
-            eprintln!("     htmlsnapshot get attr \"img[src]:expr(width > 200 && height > 200)\" src --limit 20  # large images only");
+        for line in htmlsnapshot_attr_suggestion_lines() {
+            if line.contains("large images") && image_count == 0 {
+                continue;
+            }
+            eprintln!("{}", line);
         }
         eprintln!("     htmlsnapshot inspect  # discover recurring patterns");
         if !url.is_empty() {
@@ -9212,6 +10210,20 @@ async fn handle_html_snapshot_capture(
     }
 
     Ok(())
+}
+
+/// The standard "Try these next" attribute-extraction suggestions.
+///
+/// Every line uses `get all attr`: single-element `get attr` returns only the
+/// first match and silently ignores `--limit`, so the old suggestions produced
+/// partial data for anyone who copied them.  One helper keeps the call sites
+/// (capture tip + two inspect branches) from drifting apart again.
+fn htmlsnapshot_attr_suggestion_lines() -> [&'static str; 3] {
+    [
+        "     htmlsnapshot get all attr \"img[src]\" src --limit 20  # image URLs",
+        "     htmlsnapshot get all attr \"a[href]\" href --limit 20  # link URLs",
+        "     htmlsnapshot get all attr \"img[src]:expr(width > 200 && height > 200)\" src --limit 20  # large images only",
+    ]
 }
 
 /// Fields accepted by `htmlsnapshot get [all]`.
@@ -9374,13 +10386,10 @@ async fn handle_html_snapshot_get(
             None
         };
         match array_count {
-            Some(1) => {
-                let display_selector = if selector.is_empty() { ":root" } else { selector };
-                cli_println!(
-                    "1 result found for \"{}\". If you expected more, the selector may be too narrow - try `htmlsnapshot inspect \"{}\"` to discover alternatives.",
-                    display_selector, display_selector
-                );
-            }
+            // One match is the normal outcome for a unique selector (`h1`,
+            // `#id`, a single form field): use the same count wording as the
+            // n>1 arm instead of a nagging "may be too narrow" template.
+            Some(1) => cli_println!("1 element matched."),
             Some(n) => cli_println!("{} elements matched.", n),
             None => {}
         }
@@ -11329,9 +12338,10 @@ async fn handle_html_snapshot_inspect(
                 }
             }
         }
-        cli_println!("     htmlsnapshot get attr \"img[src]\" src --limit 20  # image URLs");
-        cli_println!("     htmlsnapshot get attr \"a[href]\" href --limit 20  # link URLs");
-        cli_println!("     htmlsnapshot get attr \"img[src]:expr(width > 200 && height > 200)\" src --limit 20  # large images only");
+        cli_println!("     htmlsnapshot get all text \"a\" --limit 20  # link texts");
+        for line in htmlsnapshot_attr_suggestion_lines() {
+            cli_println!("{}", line);
+        }
         // The SQL template embeds the selector inside a single-quoted SQL
         // literal inside a double-quoted shell argument — a selector carrying
         // either quote style cannot be shown inline safely; skip rather than
@@ -11342,9 +12352,9 @@ async fn handle_html_snapshot_inspect(
     } else {
         // Fallback when no quality selectors found (e.g., all bare tags)
         cli_println!("  💡 Try these next:");
-        cli_println!("     htmlsnapshot get attr \"img[src]\" src --limit 20  # image URLs");
-        cli_println!("     htmlsnapshot get attr \"a[href]\" href --limit 20  # link URLs");
-        cli_println!("     htmlsnapshot get attr \"img[src]:expr(width > 200 && height > 200)\" src --limit 20  # large images only");
+        for line in htmlsnapshot_attr_suggestion_lines() {
+            cli_println!("{}", line);
+        }
         cli_println!("    Use a more specific CSS selector for targeted extraction:");
         cli_println!("     htmlsnapshot inspect \".card\" --max 20 --depth 6");
     }
@@ -13680,6 +14690,29 @@ fn extract_readable_agent_status(status: &Value) -> String {
 // Swarm command handlers
 // ---------------------------------------------------------------------------
 
+/// Effective defaults for `swarm create` when the option is omitted.
+///
+/// These mirror the values documented in `--help swarm create`
+/// (`--max-open-tabs` default 8, `--max-browser-contexts` default 2): the echo
+/// line must report what was actually applied, not the word "default".
+const SWARM_DEFAULT_MAX_OPEN_TABS: &str = "8";
+const SWARM_DEFAULT_MAX_BROWSER_CONTEXTS: &str = "2";
+
+/// One-line report of the terminal swarm tasks `swarm create` auto-cleaned.
+///
+/// The non-interactive path prunes completed/failed tasks from prior sessions
+/// without asking, so the message must name them — otherwise a script cannot
+/// tell "nothing was tracked" from "your history was pruned".
+fn auto_cleaned_swarm_tasks_message(pruned: &[state::AsyncTaskEntry]) -> String {
+    let ids: Vec<&str> = pruned.iter().map(|t| t.task_id.as_str()).collect();
+    format!(
+        "Auto-cleaned {} completed swarm task(s) from prior sessions (non-interactive auto-clean; \
+         use `swarm list` before `swarm create` if you need to keep them): {}",
+        ids.len(),
+        ids.join(", ")
+    )
+}
+
 async fn handle_swarm_create(
     client: &Client,
     base_url: &str,
@@ -13764,11 +14797,16 @@ async fn handle_swarm_create(
             .tasks
             .retain(|t| !(is_swarm_task(t) && is_terminal(t)));
         let _ = write_async_tasks(&existing, None);
-        cli_println!(
-            "Auto-cleaned {} completed swarm task(s) from prior sessions.",
-            pruned.len()
-        );
+        // Name the tasks that were removed: a script that relies on retained
+        // tracking must be able to see (and re-submit) what was cleaned.  The
+        // non-TTY path auto-cleans without asking, so silence here is
+        // indistinguishable from "nothing was tracked".
+        cli_println!("{}", auto_cleaned_swarm_tasks_message(&pruned));
         json_field("auto_cleaned_tasks", json!(pruned.len()));
+        json_field(
+            "auto_cleaned_task_ids",
+            json!(pruned.iter().map(|t| t.task_id.as_str()).collect::<Vec<_>>()),
+        );
     }
 
     let swarm_tasks: Vec<_> = existing
@@ -13855,7 +14893,9 @@ async fn handle_swarm_create(
 
     // Echo the effective session configuration so users can confirm their
     // tuning flags were honored (and spot an accidental GUI session before
-    // windows pop up).
+    // windows pop up).  Omitted options are resolved to the documented
+    // effective defaults rather than printed as "default", which left the user
+    // guessing what was actually applied.
     let cap_str = |key: &str, default: &str| -> String {
         echo_capabilities
             .get(key)
@@ -13868,8 +14908,8 @@ async fn handle_swarm_create(
         "Swarm session created: {} (display={}, contexts={}, max-tabs={})",
         session_id,
         cap_str("displayMode", "HEADLESS"),
-        cap_str("maxBrowserContexts", "default"),
-        cap_str("maxOpenTabs", "default")
+        cap_str("maxBrowserContexts", SWARM_DEFAULT_MAX_BROWSER_CONTEXTS),
+        cap_str("maxOpenTabs", SWARM_DEFAULT_MAX_OPEN_TABS)
     );
     // Cold-start cue: browser contexts boot lazily after create returns, so
     // first submissions sit "queued" for up to ~60s on a fresh session.  Say
@@ -15037,6 +16077,33 @@ async fn refresh_tracked_swarm_statuses(
     backend_reachable
 }
 
+/// Label for the `swarm list` window line.
+///
+/// The date/zone suffix lives in the value; the label says whether the line
+/// describes one batch or every tracked task, so "Batch window" is never used
+/// for a listing that spans several batches.
+fn swarm_window_label(batch_scoped: bool) -> &'static str {
+    if batch_scoped {
+        "Batch window (local)"
+    } else {
+        "Tracked window (local)"
+    }
+}
+
+/// Render a swarm task window (`earliest start -> latest finish`) in **local**
+/// time — the same time base as the task rows printed below it.
+fn format_swarm_window(started: DateTime<Utc>, finished: DateTime<Utc>) -> String {
+    format!(
+        "{} -> {}",
+        started
+            .with_timezone(&Local)
+            .format("%Y-%m-%d %H:%M:%S"),
+        finished
+            .with_timezone(&Local)
+            .format("%Y-%m-%d %H:%M:%S")
+    )
+}
+
 async fn handle_swarm_list(
     client: &Client,
     base_url: &str,
@@ -15094,8 +16161,10 @@ async fn handle_swarm_list(
     {
         let before = filtered.len();
         filtered.retain(|t| t.batch_id.as_deref() == Some(batch));
+        // "N of M tracked" read as "N selected out of M" / "N of M failed";
+        // state plainly how many the batch holds and how many exist overall.
         cli_println!(
-            "Batch {}: {} of {} tracked swarm task(s)",
+            "Batch {}: {} task(s) ({} tracked in total)",
             batch, filtered.len(), before
         );
     }
@@ -15113,7 +16182,7 @@ async fn handle_swarm_list(
         let before = filtered.len();
         filtered.retain(|t| swarm_status_matches(&t.last_status, &wanted));
         cli_println!(
-            "Filter: {} ({} of {} tracked swarm task(s))",
+            "Filter: {} — {} task(s) ({} tracked in total)",
             wanted, filtered.len(), before
         );
     }
@@ -15154,10 +16223,19 @@ async fn handle_swarm_list(
             .max();
         if let (Some(started), Some(finished)) = (started, finished) {
             let window_ms = (finished - started).num_milliseconds().max(0);
+            // One time base for the whole command: the task rows below are
+            // rendered in local time (state::summarize_async_tasks), so the
+            // window must be local too — formatting it as UTC produced an
+            // 8-hour offset inside a single output on a UTC+8 machine.
+            let batch_scoped = tool_params
+                .get("batch")
+                .and_then(|v| v.as_str())
+                .is_some()
+                || batch_id.is_some();
             cli_println!(
-                "Batch window: {} -> {} ({}), {} task(s)",
-                started.format("%H:%M:%S"),
-                finished.format("%H:%M:%S"),
+                "{}: {} ({}), {} task(s)",
+                swarm_window_label(batch_scoped),
+                format_swarm_window(started, finished),
                 state::format_duration_ms(window_ms),
                 filtered.len()
             );
@@ -16783,25 +17861,12 @@ const CRAWL_MAX_TASK_TIMEOUT_MS: i64 = 3_600_000;
 /// A task budget in milliseconds: a plain integer means seconds (the same reading the load
 /// options use), and `ms`/`s`/`m`/`h`/`d` suffixes are honoured. `None` when the value is not
 /// a duration at all.
+///
+/// Delegates to [commands::crawl_timeout_to_millis] so `--timeout` is validated and
+/// translated by exactly one implementation (the CLI-side copy had drifted into a
+/// second parser).
 fn crawl_timeout_to_millis(value: &str) -> Option<i64> {
-    let value = value.trim();
-    if !is_duration_value(value) {
-        return None;
-    }
-    let (number, factor) = if let Some(number) = value.strip_suffix("ms") {
-        (number, 1_i64)
-    } else if let Some(number) = value.strip_suffix('s') {
-        (number, 1_000)
-    } else if let Some(number) = value.strip_suffix('m') {
-        (number, 60_000)
-    } else if let Some(number) = value.strip_suffix('h') {
-        (number, 3_600_000)
-    } else if let Some(number) = value.strip_suffix('d') {
-        (number, 86_400_000)
-    } else {
-        (value, 1_000)
-    };
-    number.parse::<i64>().ok().map(|n| n * factor)
+    commands::crawl_timeout_to_millis(value)
 }
 
 /// Validate the --timeout value: a duration inside the range one request may ask for.
@@ -17053,8 +18118,13 @@ fn crawl_seed_https_hint(raw: &str) -> Option<String> {
 /// [origin] names where the value came from (`command argument`, `urls.txt line 3`), so a refused
 /// seed in a large seed file can be found instead of only recognized.
 fn crawl_seed_refusal(seed: &str, origin: &str) -> Option<String> {
-    crawl_seed_problem(seed)
-        .map(|problem| format!("Invalid crawl URL '{seed}' ({origin}): {problem}."))
+    crawl_seed_problem(seed).map(|problem| {
+        // The hint form of the problem already ends with '?' ("did you mean
+        // 'https://…'?") — appending the sentence period unconditionally
+        // produced the double terminator "?.".
+        let terminator = if problem.ends_with(['.', '?', '!']) { "" } else { "." };
+        format!("Invalid crawl URL '{seed}' ({origin}): {problem}{terminator}")
+    })
 }
 
 /// Resolve the URL list for a crawl: combines the direct URL argument with URLs from the seed file
@@ -20977,11 +22047,9 @@ fn find_declared_cli_spec<'a>(specs: &'a [CliToolSpec], spaced: &str) -> Option<
 
 /// Fetch the raw tool specs served by `GET /mcp/tools/specs`.
 ///
-/// Returns an empty vec when the backend is unreachable, answers with an error,
-/// or advertises no specs — every caller degrades to a one-line message rather
-/// than failing. The timeout is deliberately short: this is a discovery probe
-/// (`plugin commands`, `--help --examples`), not a tool call, so an absent
-/// backend must not stall the command.
+/// Callers that only list whatever the backend advertises use
+/// [fetch_tool_spec_values]; callers that must tell "no specs" from "the request
+/// failed" use [probe_tool_specs_within] directly.
 /// Budget for the optional plugin-declared-command section appended to help.
 ///
 /// The static reference is printed *before* this runs, so the wait never delays
@@ -20989,25 +22057,58 @@ fn find_declared_cli_spec<'a>(specs: &'a [CliToolSpec], spaced: &str) -> Option<
 /// specs timeout to every help invocation either.
 const HELP_SPECS_BUDGET: std::time::Duration = std::time::Duration::from_millis(400);
 
-/// Fetch the tool specs from `GET /mcp/tools/specs` with an explicit budget.
+/// Outcome of the `GET /mcp/tools/specs` discovery probe.
 ///
-/// Discovery is best-effort everywhere it is used: an unreachable backend, a
-/// timeout or a malformed body all yield an empty list, never an error.
-async fn fetch_tool_spec_values_within(base_url: &str, budget: std::time::Duration) -> Vec<Value> {
+/// Discovery is best-effort, but "the backend answered with no specs" and "the
+/// request never completed" are different facts: the endpoint legitimately
+/// returns an empty list on a stock install (it only advertises specs whose
+/// `cliName` is set), so collapsing both into an empty `Vec` made `--help
+/// --examples` blame a healthy backend.
+enum ToolSpecFetch {
+    /// The backend answered with a (possibly empty) list of specs.
+    Specs(Vec<Value>),
+    /// The request itself failed — the reason names the endpoint and the cause.
+    Failed(String),
+}
+
+impl ToolSpecFetch {
+    /// The specs, or an empty list when the request failed.  For callers whose
+    /// behavior is identical either way (best-effort listing, help extras).
+    fn specs_or_empty(self) -> Vec<Value> {
+        match self {
+            ToolSpecFetch::Specs(specs) => specs,
+            ToolSpecFetch::Failed(_) => Vec::new(),
+        }
+    }
+}
+
+/// Fetch the tool specs from `GET /mcp/tools/specs` with an explicit budget.
+async fn probe_tool_specs_within(base_url: &str, budget: std::time::Duration) -> ToolSpecFetch {
     let url = format!("{}/mcp/tools/specs", base_url.trim_end_matches('/'));
     let Ok(client) = reqwest::Client::builder().timeout(budget).build() else {
-        return Vec::new();
+        return ToolSpecFetch::Failed(format!("could not build an HTTP client for {url}"));
     };
-    let Ok(response) = client.get(&url).send().await else {
-        return Vec::new();
+    let response = match client.get(&url).send().await {
+        Ok(response) => response,
+        Err(error) => {
+            return ToolSpecFetch::Failed(format!("GET {url} failed: {error}"));
+        }
     };
+    let status = response.status();
+    if !status.is_success() {
+        return ToolSpecFetch::Failed(format!("GET {url} returned HTTP {status}"));
+    }
     let Ok(body) = response.json::<Value>().await else {
-        return Vec::new();
+        return ToolSpecFetch::Failed(format!("GET {url} returned a body that is not JSON"));
     };
-    body.get("tools")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default()
+    match body.get("tools").and_then(|v| v.as_array()) {
+        Some(specs) => ToolSpecFetch::Specs(specs.clone()),
+        None => ToolSpecFetch::Failed(format!("GET {url} answered without a 'tools' array")),
+    }
+}
+
+async fn fetch_tool_spec_values_within(base_url: &str, budget: std::time::Duration) -> Vec<Value> {
+    probe_tool_specs_within(base_url, budget).await.specs_or_empty()
 }
 
 async fn fetch_tool_spec_values(base_url: &str) -> Vec<Value> {
@@ -21317,21 +22418,50 @@ fn examples_or_reason(public: &str, local: &[String], reason: &str) -> String {
     lines.join("\n")
 }
 
+/// Why `--help --examples` has no tool-level examples to show.
+///
+/// `GET /mcp/tools/specs` only advertises specs that declare a `cliName`
+/// (plugin-declared CLI commands), so an HTTP 200 with an empty list is the
+/// *normal* answer on a stock install — reporting "is the backend running?"
+/// for it (as the CLI used to) misdiagnoses a healthy backend.
+fn no_tool_level_examples_reason() -> String {
+    "the backend is running but advertises no tool-level examples \
+     (`/mcp/tools/specs` lists plugin-declared CLI commands only)."
+        .to_string()
+}
+
 /// Like [build_command_examples] but for an already-resolved tool — used by
 /// plugin-declared commands (`ToolSpec.cliName`), whose tool name comes from the
 /// spec rather than from `CommandDef.tool_name_fn`.
 ///
-/// `Err` carries the reason as a phrase the caller drops into its own message
-/// (`"is the backend running?"`), so both the one-line report and the built-in
-/// fallback can explain themselves.
+/// `Err` carries the reason as a phrase the caller drops into its own message,
+/// so both the one-line report and the built-in fallback can explain themselves.
 async fn build_tool_examples(base_url: &str, tool: &str) -> Result<String, String> {
-    let specs: Vec<ToolSpecDoc> = fetch_tool_spec_values(base_url)
-        .await
+    let values = match probe_tool_specs_within(base_url, std::time::Duration::from_secs(2)).await {
+        // The request failed (unreachable, timeout, HTTP error, malformed body):
+        // only here is "is the backend running?" the honest diagnosis.
+        ToolSpecFetch::Failed(reason) => {
+            return Err(format!("is the backend running? ({reason})"));
+        }
+        // HTTP 200 with no specs: the tools endpoint answered, it just has
+        // nothing tool-level to advertise.
+        ToolSpecFetch::Specs(values) if values.is_empty() => {
+            return Err(no_tool_level_examples_reason());
+        }
+        ToolSpecFetch::Specs(values) => values,
+    };
+    let specs: Vec<ToolSpecDoc> = values
         .iter()
         .filter_map(|value| serde_json::from_value(value.clone()).ok())
         .collect();
     if specs.is_empty() {
-        return Err("is the backend running?".to_string());
+        // The list was non-empty but nothing deserialized — the endpoint
+        // answered with a shape this CLI does not understand.
+        return Err(format!(
+            "the backend's tool specs could not be read (GET /mcp/tools/specs returned {} entr{} this CLI could not parse).",
+            values.len(),
+            if values.len() == 1 { "y" } else { "ies" }
+        ));
     }
 
     let Some(spec) = find_tool_spec(&specs, tool) else {
@@ -22769,7 +23899,7 @@ async fn handle_stop(base_url: &str) -> Result<(), String> {
     } else {
         stop_browser4_server_forcibly().shutdown
     };
-    finalize_global_cleanup("Stopped", &shutdown_result);
+    finalize_global_cleanup("Stopped", &shutdown_result, true);
 
     let server_was_running = !(shutdown_result.stopped_pids.is_empty()
         && shutdown_result.missing_pids.is_empty()
@@ -24906,6 +26036,7 @@ fn is_page_dependent_command(command: &str) -> bool {
         | "console"
         // Network inspection / HAR / routing — needs a live page with network traffic
         | "network-requests" | "network-request" | "network-route" | "network-unroute"
+        | "network-routes"
         | "har-start" | "har-stop"
         // Storage commands — need page origin context
         | "cookie-list" | "cookie-get" | "cookie-set" | "cookie-delete" | "cookie-clear"
@@ -24917,6 +26048,24 @@ fn is_page_dependent_command(command: &str) -> bool {
         | "state-save" | "state-load" | "delete-data"
         // Wait — needs timing on a page
         | "wait"
+    )
+}
+
+/// Message for a page-dependent command whose local backend could not be
+/// reached (or started).
+///
+/// Reports the endpoint that is down and what the user loses, instead of the
+/// old "No active browser session … open <url> first" wording, which blamed the
+/// session for a server failure.  The launcher's own error is carried verbatim
+/// so the real cause is not replaced by a second, invented one.
+fn backend_unreachable_message(base_url: &str, command: &str, cause: &str) -> String {
+    let bin = cli_binary_name();
+    format!(
+        "Browser4 backend is not reachable at {} — '{command}' needs a running server.\n\
+         The saved session's live page/tab state is lost with the previous backend instance; \
+         after it is reachable again, run '{bin} open <url>' or '{bin} goto <url>' to load a page.\n\
+         Cause: {cause}",
+        base_url.trim_end_matches('/')
     )
 }
 
@@ -25283,7 +26432,7 @@ fn rewrite_prefixed_command(args: &[String]) -> Option<Vec<String>> {
             rewritten.extend(args[3..].iter().cloned());
             return Some(rewritten);
         }
-        let known_subs = ["requests", "request", "route", "unroute"];
+        let known_subs = ["requests", "request", "route", "unroute", "routes"];
         if known_subs.contains(&sub.as_str()) {
             let mut rewritten = vec![format!("network-{}", sub)];
             rewritten.extend(args[2..].iter().cloned());
@@ -25443,6 +26592,7 @@ fn preferred_spaced_command_form(command: &str) -> Option<&'static str> {
         "network-request" => Some("network request"),
         "network-route" => Some("network route"),
         "network-unroute" => Some("network unroute"),
+        "network-routes" => Some("network routes"),
         "har-start" => Some("network har start"),
         "har-stop" => Some("network har stop"),
         "profiles-list" => Some("profiles list"),
@@ -27217,6 +28367,13 @@ async fn run(
     // Validate required positional arguments (fast-fail for malformed commands).
     validate_required_args(cmd_def, &parsed)?;
     validate_command_semantics(&command, &parsed)?;
+    // Reject options the command does not declare: a misplaced or misspelled
+    // flag used to be dropped silently (e.g. `htmlsnapshot get --bogus`, or
+    // `--limit` on a single-element `get`, which then returned only the first
+    // match as if all had been asked for).
+    args::validate_command_options(&command, &parsed).map_err(|message| {
+        CliError(ExitCode::Usage, message)
+    })?;
 
     // Support --json after the command name (e.g. "tab-list --json").  When
     // --json appears before the command it is captured by parse_global_flags;
@@ -27316,6 +28473,16 @@ async fn run(
     // the cookie filter or target the wrong page domain.  Only the commands
     // whose tool_params_fn sets the `_invalid_domain` sentinel are checked
     // (state-save/state-load accept no --domain option and never set it).
+    // `set` validation lives in commands.rs (it knows the mode-specific option
+    // rules); the sentinel carries the user-facing message for a command that
+    // parsed but cannot be built.
+    if let Some(message) = tool_params
+        .get(commands::CLI_ERROR_SENTINEL)
+        .and_then(|v| v.as_str())
+    {
+        return Err(CliError(ExitCode::Usage, message.to_string()));
+    }
+
     if matches!(command, "cookie-set" | "cookie-delete" | "cookie-list" | "cookie-get") {
         if let Some(bad) = tool_params.get("_invalid_domain").and_then(|v| v.as_str()) {
             return Err(CliError(
@@ -27374,22 +28541,42 @@ async fn run(
     }
 
     // Ensure the Browser4 server is running (for relevant commands).
-    // Page-dependent commands targeting localhost do NOT auto-start the server
-    // — the user should run `open <url>` or `goto <url>` first so a page is
-    // already loaded.  Remote servers (--server <url>) always proceed normally.
+    //
+    // The backend is started (or restarted) **before** any page-dependent
+    // command is refused: a closed local port means the *server* is gone, not
+    // that the session has no page.  Blaming the session sent users hunting for
+    // a missing `open <url>` while the real problem was a dead backend (see the
+    // form-filling report).  Remote servers (--server <url>) proceed normally.
     if should_ensure_server_running(command) {
         let is_local = base_url.contains("localhost") || base_url.contains("127.0.0.1");
-        if is_page_dependent_command(command) && is_local && !is_local_port_open(&base_url) {
-            let bin = cli_binary_name();
-            return Err(CliError(
-                ExitCode::Session,
-                format!(
-                    "No active browser session. Run '{bin} open <url>' or '{bin} goto <url>' first to load a page, then try '{}' again.",
-                    command
-                ),
-            ));
+        let page_dependent_local = is_local && is_page_dependent_command(command);
+        let backend_was_down = is_local && !is_local_port_open(&base_url);
+        match ensure_server_running(&base_url, should_enforce_server_version(global)).await {
+            Ok(()) => {
+                if page_dependent_local && backend_was_down {
+                    // The backend answered only because it was just (re)started:
+                    // the session record survives in the state file, but the live
+                    // browser page/tab state belonged to the previous instance.
+                    eprintln!(
+                        "ℹ Browser4 backend at {} was not running and has been started; \
+                         any live page/tab state from the previous backend instance is lost. \
+                         Re-run '{bin} open <url>' or '{bin} goto <url>' if '{command}' reports a session refresh.",
+                        base_url.trim_end_matches('/'),
+                        bin = cli_binary_name(),
+                        command = command,
+                    );
+                }
+            }
+            Err(err) => {
+                if page_dependent_local {
+                    return Err(CliError(
+                        ExitCode::Server,
+                        backend_unreachable_message(&base_url, command, &err),
+                    ));
+                }
+                return Err(err.into());
+            }
         }
-        ensure_server_running(&base_url, should_enforce_server_version(global)).await?;
     }
 
     let client = make_client();
@@ -27923,10 +29110,11 @@ async fn run(
                 .unwrap_or(false);
 
             // Scripts written in the natural "compute and log" style (or with
-            // --file IIFEs that console.log their results) print only the
-            // expression's return value — console output is not captured by
-            // the tool boundary.  Warn before running so a bare 'null' result
-            // is not mistaken for a broken script.
+            // --file IIFEs that console.log their results) evaluate to no value:
+            // `eval` prints the expression's return value, while console.log
+            // output lands in the page's console buffer (read it with `console`
+            // / `errors`).  Warn before running so a bare 'null' result is not
+            // mistaken for a broken script.
             if !eval_json && !quiet_active() {
                 let expression = tool_params
                     .get("expression")
@@ -27934,8 +29122,9 @@ async fn run(
                     .unwrap_or("");
                 if expression.contains("console.log(") || expression.contains("console.log (") {
                     eprintln!(
-                        "ℹ️  console.log() output is not captured — only the expression's return \
-                         value is shown. Use `return` / end with the value to see it."
+                        "ℹ️  console.log() output is not eval's return value — it is captured in the \
+                         page console buffer. Use `return` / end with the value to see it here, or read \
+                         it with `console`."
                     );
                 }
             }
@@ -28493,6 +29682,253 @@ async fn run(
             )
             .await?;
         }
+        "set" => {
+            // `set <mode>` maps to a raw CDP call whose successful result is an
+            // empty object, and printing that verbatim made every `set` look like
+            // `{}` — no confirmation that anything was applied, and no way to tell
+            // an abort route from a mock.  Print what was applied instead; the raw
+            // payload stays available through --json.
+            let raw = call_session_tool(
+                &client,
+                &base_url,
+                global.session_name.as_deref(),
+                &tool_name,
+                tool_params.clone(),
+            )
+            .await?;
+            json_field("result", json!(&raw));
+            if !json_active() && !quiet_active() {
+                let mode = parsed.get("mode").and_then(|v| v.as_str()).unwrap_or("");
+                match describe_cdp_application(&tool_params) {
+                    Some(applied) => cli_println!("✓ {}", applied),
+                    None => cli_println!("✓ Applied `set {}`.", mode),
+                }
+            }
+            // `set geo` needs a second call to be observable: the override alone
+            // leaves `getCurrentPosition()` pending forever because Chrome gates
+            // it on the geolocation permission (see grant_geolocation_permission).
+            // A grant that cannot be issued is reported — an emulation the page
+            // cannot see must not look like success — but it does not undo the
+            // override that was just applied.
+            if is_geolocation_override(&tool_params) {
+                match grant_geolocation_permission(&client, &base_url, global.session_name.as_deref())
+                    .await
+                {
+                    Ok(origin) if !json_active() && !quiet_active() => {
+                        cli_println!("✓ Geolocation permission granted for {origin}");
+                    }
+                    Ok(_) => {}
+                    Err(reason) => {
+                        eprintln!(
+                            "⚠ The geolocation override was applied but the geolocation permission \
+                             could not be granted ({reason}). Page script will not see the emulated \
+                             position: grant it manually with \
+                             `cdp Browser.grantPermissions '{{\"permissions\":[\"geolocation\"],\"origin\":\"<origin>\"}}'`."
+                        );
+                    }
+                }
+            }
+        }
+        "frames" | "frame" => {
+            // `frame_list` answers with JSON and `frame_main` answers with nothing;
+            // both were printed verbatim, so `frames` showed raw JSON (against its
+            // own documentation) and `frame main` showed no confirmation that the
+            // scope had been cleared.  Render the tree, confirm the scope, and keep
+            // the raw payload behind --json.
+            let raw = call_session_tool(
+                &client,
+                &base_url,
+                global.session_name.as_deref(),
+                &tool_name,
+                tool_params.clone(),
+            )
+            .await?;
+            json_field("result", json!(&raw));
+            if json_active() {
+                println!("{}", maybe_pretty_print_json(raw.trim()));
+            } else if tool_name == "frame_main" {
+                cli_println!("✓ Frame scope: main document");
+            } else if command == "frames" {
+                cli_println!("{}", render_frame_tree(&raw));
+            } else {
+                let target = parsed
+                    .get("target")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                match describe_frame_scope(&raw) {
+                    Some(scope) => cli_println!("✓ Frame scope: {scope}"),
+                    None => cli_println!("✓ Frame scope: {target}"),
+                }
+            }
+        }
+        "network-requests" => {
+            // The tool answers with the whole tracked buffer as JSON; the compact
+            // table is what the command documents, and --json keeps the raw data.
+            let clear = parsed
+                .get("clear")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            // `--clear` drops the buffer inside the tool and returns the (now
+            // empty) list, so counting what it destroyed needs one reading first —
+            // otherwise "cleared" is indistinguishable from "was already empty".
+            let dropped = if clear {
+                call_session_tool(
+                    &client,
+                    &base_url,
+                    global.session_name.as_deref(),
+                    &tool_name,
+                    json!({}),
+                )
+                .await
+                .map(|before| count_network_entries(&before))
+                .ok()
+            } else {
+                None
+            };
+            let raw = call_session_tool(
+                &client,
+                &base_url,
+                global.session_name.as_deref(),
+                &tool_name,
+                tool_params.clone(),
+            )
+            .await?;
+            json_field("result", json!(&raw));
+            if json_active() {
+                println!("{}", maybe_pretty_print_json(raw.trim()));
+            } else {
+                if let Some(count) = dropped {
+                    cli_println!("Cleared {} tracked request(s).", count);
+                }
+                let limit = parsed
+                    .get("limit")
+                    .and_then(|v| match v {
+                        Value::Number(number) => number.as_u64(),
+                        Value::String(text) => text.trim().parse::<u64>().ok(),
+                        _ => None,
+                    })
+                    .map(|n| n as usize);
+                cli_println!("{}", render_network_requests(&raw, limit));
+            }
+        }
+        "download" => {
+            // The CDP call answers with an empty object, so the useful fact — where
+            // the browser will write — was never reported.  The directory was
+            // resolved client-side already, so validate it here: Chrome accepts a
+            // path it cannot write to and then fails every download with
+            // `Download.InterruptedReason = FILE_FAILED`, which is invisible until
+            // something is actually downloaded.
+            let params = tool_params.get("params");
+            let dir = params
+                .and_then(|p| p.get("downloadPath"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let behavior = params
+                .and_then(|p| p.get("behavior"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("allow")
+                .to_string();
+            if behavior == "allow" && !dir.is_empty() {
+                if let Err(err) = std::fs::create_dir_all(&dir) {
+                    return Err(CliError(
+                        ExitCode::Usage,
+                        format!(
+                            "download: cannot use --dir '{}': {}.\n\
+                             Give a directory the CLI can create and the browser process can write to.",
+                            dir,
+                            describe_io_error(&err)
+                        ),
+                    ));
+                }
+            }
+            let raw = call_session_tool(
+                &client,
+                &base_url,
+                global.session_name.as_deref(),
+                &tool_name,
+                tool_params.clone(),
+            )
+            .await?;
+            json_field("result", json!(&raw));
+            if !json_active() && !quiet_active() {
+                if dir.is_empty() {
+                    cli_println!("✓ Download behavior set: {}", behavior);
+                } else {
+                    cli_println!(
+                        "✓ Downloads {}: saving to {} (files land there when the page triggers a download)",
+                        if behavior == "deny" { "denied" } else { "allowed" },
+                        dir
+                    );
+                }
+            }
+        }
+        "upload" => {
+            // The upload tool returns no payload, so the outcome had to be inferred
+            // from the page.  Report what was uploaded (the paths were resolved to
+            // absolute ones above, and the browser reads them on the backend host).
+            let raw = call_session_tool(
+                &client,
+                &base_url,
+                global.session_name.as_deref(),
+                &tool_name,
+                tool_params.clone(),
+            )
+            .await?;
+            json_field("result", json!(&raw));
+            if !json_active() && !quiet_active() {
+                let selector = tool_params
+                    .get("ref")
+                    .or_else(|| tool_params.get("selector"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let mut files: Vec<String> = tool_params
+                    .get("paths")
+                    .and_then(|v| v.as_array())
+                    .map(|list| {
+                        list.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if files.is_empty() {
+                    if let Some(file) = tool_params.get("file").and_then(|v| v.as_str()) {
+                        files.push(file.to_string());
+                    }
+                }
+                cli_println!(
+                    "✓ Uploaded {} file(s) to {}: {}",
+                    files.len(),
+                    if selector.is_empty() { "the file input" } else { selector },
+                    if files.is_empty() {
+                        "(no path reported)".to_string()
+                    } else {
+                        files.join(", ")
+                    }
+                );
+            }
+        }
+        "network-routes" => {
+            // Read-only counterpart of network route/unroute: before this, the only
+            // way to see the active routes was to remove them all with
+            // `network unroute` (the docs said so), which destroyed the state the
+            // caller wanted to inspect.
+            let raw = call_session_tool(
+                &client,
+                &base_url,
+                global.session_name.as_deref(),
+                &tool_name,
+                tool_params.clone(),
+            )
+            .await?;
+            json_field("result", json!(&raw));
+            if json_active() {
+                println!("{}", maybe_pretty_print_json(raw.trim()));
+            } else {
+                cli_println!("{}", render_network_routes(&raw));
+            }
+        }
         "cdp" => {
             // Support --json, --file, and --stdin for CDP params.
             // After resolving params, pass method and params to execute_cdp_command.
@@ -28566,6 +30002,58 @@ async fn run(
                 command,
             )
             .await?;
+        }
+        cmd if is_assertion_command(cmd) => {
+            // `--fail-on-false` makes the assertion's verdict the exit code, so a
+            // script gate does not have to parse stdout.  Opt-in on purpose:
+            // without the flag the historical "print true/false, always exit 0"
+            // contract is untouched, and a false assertion is a legitimate answer,
+            // not an error.  A `null` verdict (no element matched) is not a pass.
+            let verdict_flag = parsed
+                .get("fail-on-false")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if !verdict_flag {
+                handle_tool_command(
+                    &client,
+                    &base_url,
+                    &tool_name,
+                    &tool_params,
+                    false,
+                    global.session_name.as_deref(),
+                )
+                .await?;
+            } else {
+                let raw = call_session_tool(
+                    &client,
+                    &base_url,
+                    global.session_name.as_deref(),
+                    &tool_name,
+                    tool_params.clone(),
+                )
+                .await?;
+                json_field("result", json!(&raw));
+                cli_println!("{}", raw.trim());
+                match parse_assertion_verdict(&raw) {
+                    Some(true) => {}
+                    Some(false) => {
+                        return Err(CliError(
+                            ExitCode::General,
+                            format!("{} is false (--fail-on-false).", command.replace('-', " ")),
+                        ));
+                    }
+                    None => {
+                        return Err(CliError(
+                            ExitCode::General,
+                            format!(
+                                "{} could not be evaluated: no element answered the selector \
+                                 (--fail-on-false treats that as a failure).",
+                                command.replace('-', " ")
+                            ),
+                        ));
+                    }
+                }
+            }
         }
         _ => {
             if tool_name.is_empty() {
@@ -28879,6 +30367,111 @@ fn print_declared_help(target: Option<&str>, specs: &[CliToolSpec]) -> bool {
     true
 }
 
+/// Outcome of a wait tool, decoded from the backend's return value.
+///
+/// The backend encodes a wait's result as a number: a **positive** value is the
+/// elapsed milliseconds until the condition was satisfied, while a **negative**
+/// status code (e.g. -6 / -8) or an explicit `null` means the condition was
+/// never observed within the timeout.  The CLI used to ignore the value
+/// entirely and always print a success line, so an unready page read as ready.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitOutcome {
+    /// The awaited condition was satisfied (elapsed ms when the backend reports it).
+    Satisfied(Option<i64>),
+    /// The wait ended without the condition ever becoming true.
+    TimedOut(Option<i64>),
+    /// The payload carries no timing signal (mock transports, JSON-object
+    /// payloads) — treated as success, matching the pre-existing behaviour.
+    Unknown,
+}
+
+/// Decode the backend's wait return value.  See [WaitOutcome].
+///
+/// An empty payload is *not* a timeout: several transports (and the unit tests
+/// that pin this formatting) hand back an empty string for a wait that was
+/// dispatched successfully, and the backend's own failure signal is the
+/// negative status code / `null` documented in the issue report.
+fn classify_wait_outcome(tool_name: &str, result: &str) -> WaitOutcome {
+    if tool_name == "delay" {
+        // `delay` always completes; its value carries the sleep it performed.
+        return WaitOutcome::Satisfied(None);
+    }
+    let trimmed = result.trim();
+    if trimmed.is_empty() {
+        return WaitOutcome::Unknown;
+    }
+    if trimmed.eq_ignore_ascii_case("null") || trimmed.eq_ignore_ascii_case("undefined") {
+        return WaitOutcome::TimedOut(None);
+    }
+    // Numbers arrive bare (`-6`) or wrapped as a JSON value (`"1992"`).
+    let numeric = trimmed.parse::<i64>().ok().or_else(|| {
+        serde_json::from_str::<Value>(trimmed)
+            .ok()
+            .and_then(|value| match value {
+                Value::Number(n) => n.as_i64(),
+                Value::String(s) => s.trim().parse::<i64>().ok(),
+                _ => None,
+            })
+    });
+    match numeric {
+        Some(ms) if ms >= 0 => WaitOutcome::Satisfied(Some(ms)),
+        Some(code) => WaitOutcome::TimedOut(Some(code)),
+        None => WaitOutcome::Unknown,
+    }
+}
+
+/// Shorten a wait target for a one-line diagnostic (a `--file`/`--stdin`
+/// script can be hundreds of lines long).
+fn summarize_wait_target(target: &str) -> String {
+    let first_line = target.lines().next().unwrap_or("").trim();
+    let mut compact: String = first_line.chars().take(80).collect();
+    if first_line.chars().count() > 80 || target.lines().count() > 1 {
+        compact.push('…');
+    }
+    compact
+}
+
+/// Human message for a wait that never saw its condition become true: name the
+/// target and the timeout so the failure is actionable without `--json`.
+fn wait_timeout_message(tool_name: &str, tool_params: &Value) -> String {
+    let timeout = tool_params
+        .get("timeoutMillis")
+        .and_then(|v| v.as_i64())
+        .map(|ms| format!(" within {ms}ms"))
+        .unwrap_or_default();
+    match tool_name {
+        "wait_for_selector" => {
+            let selector = tool_params
+                .get("selector")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            format!("Timed out: element '{selector}' not found{timeout}.")
+        }
+        "wait_for_page" => {
+            let url = tool_params
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            format!("Timed out: URL did not match '{url}'{timeout}.")
+        }
+        "wait_for_function" => {
+            if is_network_idle_wait(tool_params) {
+                format!("Timed out: network did not go idle{timeout}.")
+            } else {
+                let target = tool_params
+                    .get("pageFunction")
+                    .and_then(|v| v.as_str())
+                    .map(summarize_wait_target)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| format!(" '{s}'"))
+                    .unwrap_or_default();
+                format!("Timed out: condition{target} never became true{timeout}.")
+            }
+        }
+        _ => format!("Timed out: wait condition never became true{timeout}."),
+    }
+}
+
 /// Format the result of wait-related tools into a user-friendly message.
 /// Wait tools (wait_for_function, delay, etc.) return internal driver JSON
 /// that is meaningless to users. This function maps them to readable messages.
@@ -29091,6 +30684,51 @@ const BLOCKED_BODY_SIGNATURES: &[&str] = &[
 /// that rendered essentially nothing.
 const IMPLAUSIBLY_EMPTY_BODY_CHARS: usize = 80;
 
+/// True for loopback and RFC1918 hosts.
+///
+/// A local fixture server serving a two-line test page is intentionally
+/// minimal, not a challenge shell, so the empty-body heuristic must never fire
+/// on it (four separate issue reports hit this on `localhost:18080` fixtures).
+fn host_is_private_or_loopback(url: &str) -> bool {
+    let Some(rest) = url.split("://").nth(1) else {
+        return false;
+    };
+    // authority = host[:port], up to the path/query/fragment.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // Strip any userinfo (`user:pass@host`).
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    let host = if let Some(stripped) = authority.strip_prefix('[') {
+        // IPv6 literal, e.g. `[::1]:8080`.
+        stripped.split(']').next().unwrap_or("")
+    } else {
+        authority.split(':').next().unwrap_or("")
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() {
+        return false;
+    }
+    if host == "localhost"
+        || host.ends_with(".localhost")
+        || host == "::1"
+        || host == "0.0.0.0"
+    {
+        return true;
+    }
+    let octets: Vec<u8> = host
+        .split('.')
+        .map_while(|part| part.parse::<u8>().ok())
+        .collect();
+    if host.split('.').count() != 4 || octets.len() != 4 {
+        return false;
+    }
+    match octets[0] {
+        127 | 10 => true,
+        192 => octets[1] == 168,
+        172 => (16..=31).contains(&octets[1]),
+        _ => false,
+    }
+}
+
 /// Path prefixes that indicate a content page rather than a challenge page.
 /// A URL marker matched inside these prefixes is a false positive (e.g.
 /// Wikipedia's `/wiki/CAPTCHA` contains the segment `captcha` but is an
@@ -29221,17 +30859,54 @@ fn detect_block_signature(url: &str, page_text: &str) -> Option<BlockSignature> 
     None
 }
 
-/// Score a landed page with full probe data (URL, text, iframe count).
-/// A page with iframes is exempt from the empty-body signal — CAPTCHA demos
-/// and widget-only pages legitimately have little body text.
-fn detect_block_signature_full(url: &str, page_text: &str, iframe_count: usize) -> Option<BlockSignature> {
+/// Score a landed page with full probe data (URL, text, iframe count,
+/// interactive-node count).
+///
+/// The weak `EmptyBody` signal is suppressed whenever something else already
+/// explains a short body: frames, interactive nodes, a loopback/RFC1918 host
+/// (local fixtures are deliberately minimal) or a snapshot that just captured
+/// interactive nodes successfully.  Real challenge URL/body markers are
+/// unaffected — they are evidence in their own right.
+fn detect_block_signature_full(
+    url: &str,
+    page_text: &str,
+    iframe_count: usize,
+    interactive_count: usize,
+) -> Option<BlockSignature> {
     let signature = detect_block_signature(url, page_text);
-    // Pages that host iframes (CAPTCHA demos, embedded widgets) are exempt from
-    // the empty-body signal — their content lives inside the frames.
-    if iframe_count > 0 && matches!(signature, Some(BlockSignature::EmptyBody(_))) {
+    if matches!(signature, Some(BlockSignature::EmptyBody(_)))
+        && (iframe_count > 0
+            || interactive_count > 0
+            || host_is_private_or_loopback(url)
+            || snapshot_confirmed_interactive_nodes())
+    {
         return None;
     }
     signature
+}
+
+thread_local! {
+    /// Interactive-node count seen by the most recent successful snapshot
+    /// capture in this process.  A snapshot is stronger evidence than raw text
+    /// length: a page that just yielded interactive nodes is not an
+    /// "implausibly empty" shell.
+    static SNAPSHOT_INTERACTIVE_NODES: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+/// Count interactive nodes in an accessibility snapshot (`… [ref=eNN]` lines).
+fn count_snapshot_interactive_nodes(snapshot: &str) -> usize {
+    snapshot.matches("[ref=").count()
+}
+
+/// Remember how many interactive nodes the latest snapshot captured.
+fn record_snapshot_interactive_nodes(snapshot: &str) {
+    let count = count_snapshot_interactive_nodes(snapshot);
+    SNAPSHOT_INTERACTIVE_NODES.with(|cell| cell.set(Some(count)));
+}
+
+/// True when the latest snapshot in this process captured ≥1 interactive node.
+fn snapshot_confirmed_interactive_nodes() -> bool {
+    SNAPSHOT_INTERACTIVE_NODES.with(|cell| cell.get().unwrap_or(0) > 0)
 }
 
 /// Short description of the signature that fired, used by both the human
@@ -29280,7 +30955,8 @@ var body=document.body;
 var text=body&&typeof body.innerText==='string'?body.innerText:'';
 var title=document.title?String(document.title)+'\n':'';
 var iframes=document.querySelectorAll('iframe').length;
-return JSON.stringify({url:String(location.href),text:(title+text).slice(0,4000),iframes:iframes});
+var interactive=document.querySelectorAll('a[href],button,input,select,textarea,[role=button],[onclick]').length;
+return JSON.stringify({url:String(location.href),text:(title+text).slice(0,4000),iframes:iframes,interactive:interactive});
 })()"#;
 
 /// URL + visible text captured by [BLOCK_PROBE_JS].
@@ -29292,6 +30968,10 @@ struct BlockProbe {
     /// short but which hosts iframes (CAPTCHA demos, embedded widgets) is not
     /// implausibly empty — its content lives inside the frames.
     iframe_count: usize,
+    /// Number of interactive elements (links, buttons, form controls).  A page
+    /// with real controls has rendered successfully, so a short body is not a
+    /// challenge signal.
+    interactive_count: usize,
 }
 
 /// Parse a [BLOCK_PROBE_JS] payload; `None` when the result has another shape,
@@ -29308,7 +30988,13 @@ fn parse_block_probe(probe_result: &str) -> Option<BlockProbe> {
         .get("iframes")
         .and_then(|value| value.as_u64())
         .unwrap_or(0) as usize;
-    Some(BlockProbe { url, text, iframe_count })
+    // Absent for older payloads (and for probes that predate this field) —
+    // 0 keeps the previous "unknown" behavior instead of suppressing.
+    let interactive_count = payload
+        .get("interactive")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0) as usize;
+    Some(BlockProbe { url, text, iframe_count, interactive_count })
 }
 
 /// Run the block probe after a successful navigation and flag a page that looks
@@ -29385,7 +31071,12 @@ fn interpret_block_probe(probe_result: &str, fallback_url: &str) -> Option<Block
     } else {
         probe.url.as_str()
     };
-    detect_block_signature_full(landed_url, &probe.text, probe.iframe_count)
+    detect_block_signature_full(
+        landed_url,
+        &probe.text,
+        probe.iframe_count,
+        probe.interactive_count,
+    )
 }
 
 // The shared process-wide env lock used by this crate's tests; the rationale
@@ -29917,6 +31608,7 @@ mod tests {
             "network-request",
             "network-route",
             "network-unroute",
+            "network-routes",
             "har-start",
             "har-stop",
         ] {
@@ -30028,9 +31720,74 @@ mod tests {
         );
     }
 
+    /// `document.querySelectorAll(…)` must no longer match the
+    /// `document.querySelector` substring — that fired the strongest
+    /// "the page may have changed — run goto" hint for the most common
+    /// extraction snippet on a perfectly good page.
     #[test]
-    fn eval_arrow_suggestion_does_not_double_prefix_element() {
-        // Exact repro: `eval "element.textContent" --ref e5` previously
+    fn expression_expects_page_content_needs_the_call_paren() {
+        assert!(expression_expects_page_content("document.title"));
+        assert!(expression_expects_page_content("document.body.innerText"));
+        assert!(expression_expects_page_content("document.querySelector('#x')"));
+        assert!(expression_expects_page_content("document.querySelector ('#x')"));
+        assert!(
+            !expression_expects_page_content("document.querySelectorAll('h1').length"),
+            "querySelectorAll is not the querySelector call form"
+        );
+        assert!(!expression_expects_page_content("window.location.href"));
+    }
+
+    /// A `--file`/`--stdin` script must not be echoed back whole in a one-line
+    /// diagnostic.
+    #[test]
+    fn summarize_expression_for_diagnostic_truncates_scripts() {
+        assert_eq!(summarize_expression_for_diagnostic("document.title"), "document.title");
+        assert_eq!(summarize_expression_for_diagnostic("  a  "), "a");
+        // Multi-line script: first line plus an ellipsis.
+        assert_eq!(
+            summarize_expression_for_diagnostic("const x = 1;\nconsole.log(x);"),
+            "const x = 1;…"
+        );
+        let long = format!("document.title{}", "x".repeat(300));
+        let shortened = summarize_expression_for_diagnostic(&long);
+        assert!(shortened.ends_with('…'), "got: {shortened}");
+        assert_eq!(shortened.chars().count(), 121, "got: {shortened}");
+    }
+
+    /// `pushstate` reaches the backend as an eval; the CLI must verify the push
+    /// by re-reading the page URL, not by trusting a null eval result.
+    #[test]
+    fn is_pushstate_eval_recognizes_only_the_pushstate_expression() {
+        let pushstate = json!({
+            "expression": "() => { history.pushState({}, '/next'); return location.href; }"
+        });
+        assert!(is_pushstate_eval("browser_evaluate", &pushstate));
+        // Other evals (and other tools) are untouched.
+        assert!(!is_pushstate_eval("browser_evaluate", &json!({"expression": "document.title"})));
+        assert!(!is_pushstate_eval("select_first_text_or_null", &pushstate));
+        assert!(!is_pushstate_eval("browser_evaluate", &json!({})));
+    }
+
+    #[test]
+    fn pushstate_failure_message_explains_the_cross_origin_rejection() {
+        let message = pushstate_failure_message(
+            Some("http://localhost:18080/a"),
+            Some("http://localhost:18080/a"),
+        );
+        assert!(
+            message.contains("did not change the page URL (still http://localhost:18080/a)"),
+            "got: {message}"
+        );
+        assert!(message.contains("cross-origin"), "got: {message}");
+        assert!(message.contains("SecurityError"), "got: {message}");
+        assert!(message.contains("goto"), "a working alternative is named: {message}");
+        // When the current URL cannot be read, the message must not invent one.
+        let unknown = pushstate_failure_message(None, None);
+        assert!(unknown.contains("<unknown>"), "got: {unknown}");
+    }
+
+    #[test]
+    fn eval_arrow_suggestion_does_not_double_prefix_element() {        // Exact repro: `eval "element.textContent" --ref e5` previously
         // suggested the broken `element => element.element.textContent`.
         assert_eq!(
             suggest_eval_element_arrow("element.textContent"),
@@ -30120,9 +31877,19 @@ mod tests {
             normalize_cookie_for_display(&fractional)["expires"],
             serde_json::json!(12.5)
         );
-        // Cookies without an expires field pass through unchanged.
+        // Cookies without an expires field keep it absent — but the display
+        // normalization fills in the rest of the fixed key set with nulls, so a
+        // consumer never has to distinguish "absent key" from "empty value".
         let no_expires = serde_json::json!({ "name": "session" });
-        assert_eq!(normalize_cookie_for_display(&no_expires), no_expires);
+        let normalized_no_expires = normalize_cookie_for_display(&no_expires);
+        assert!(normalized_no_expires["expires"].is_null());
+        assert_eq!(normalized_no_expires["name"], serde_json::json!("session"));
+        for key in COOKIE_DISPLAY_KEYS {
+            assert!(
+                normalized_no_expires.get(key).is_some(),
+                "every cookie row carries the key {key} (null when the browser did not report it)"
+            );
+        }
     }
 
     #[test]
@@ -30397,6 +32164,58 @@ mod tests {
 
     // ── get no-value diagnostics / stale refs ─────────────────────────────
 
+    // ── wait --download baseline ──────────────────────────────────────────
+
+    /// A directory that already holds unrelated files must not report a
+    /// completed download: only files that appear (or change) after the wait
+    /// starts count.
+    #[test]
+    fn new_or_changed_downloads_ignores_pre_existing_files() {
+        let temp = test_temp_dir();
+        let dir = temp.path();
+        std::fs::write(dir.join("README.txt"), b"pre-existing").unwrap();
+
+        let baseline = snapshot_download_dir(dir);
+        assert!(
+            new_or_changed_downloads(dir, &baseline).is_empty(),
+            "a pre-existing file is not a completed download"
+        );
+
+        // A file that appears after the baseline counts.
+        std::fs::write(dir.join("report.csv"), b"a,b\n1,2\n").unwrap();
+        assert_eq!(
+            new_or_changed_downloads(dir, &baseline),
+            vec!["report.csv".to_string()]
+        );
+
+        // A file whose content changed also counts (in-place download).
+        std::fs::write(dir.join("README.txt"), b"pre-existing, overwritten").unwrap();
+        let names = new_or_changed_downloads(dir, &baseline);
+        assert!(names.contains(&"report.csv".to_string()), "got: {names:?}");
+        assert!(names.contains(&"README.txt".to_string()), "got: {names:?}");
+
+        // In-flight temporary names never count as completed.
+        std::fs::write(dir.join("big.zip.crdownload"), b"partial").unwrap();
+        std::fs::write(dir.join("other.part"), b"partial").unwrap();
+        let names = new_or_changed_downloads(dir, &baseline);
+        assert!(
+            !names.iter().any(|n| n.ends_with(".crdownload") || n.ends_with(".part")),
+            "got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn snapshot_download_dir_sees_the_current_listing() {
+        let temp = test_temp_dir();
+        let dir = temp.path();
+        std::fs::write(dir.join("a.txt"), b"1").unwrap();
+        let snapshot = snapshot_download_dir(dir);
+        assert!(snapshot.contains_key("a.txt"));
+        assert_eq!(snapshot.len(), 1);
+        // A missing directory yields an empty baseline rather than a panic.
+        assert!(snapshot_download_dir(&dir.join("nope")).is_empty());
+    }
+
     #[test]
     fn get_attr_null_message_does_not_claim_no_elements_matched() {
         let lines = get_no_value_diagnostic_lines("attr", "#email", "class");
@@ -30422,6 +32241,40 @@ mod tests {
         let css_lines = get_no_value_diagnostic_lines("text", "#result-data", "");
         assert!(!css_lines.join("\n").contains("Refs expire"));
         assert!(css_lines[0].contains("No elements matched \"#result-data\"."));
+    }
+
+    /// The mode is encoded in the MCP tool name (commands.rs sends only
+    /// attrName/propName), so `handle_get` must infer it — reading only `mode`
+    /// fell back to "text" and the attr/property wording never ran.
+    #[test]
+    fn get_mode_is_inferred_from_the_backend_tool_name() {
+        assert_eq!(get_mode_from_tool_name("select_first_attribute_or_null"), "attr");
+        assert_eq!(
+            get_mode_from_tool_name("select_first_property_value_or_null"),
+            "property"
+        );
+        assert_eq!(get_mode_from_tool_name("bounding_box"), "box");
+        assert_eq!(get_mode_from_tool_name("select_first_text_or_null"), "text");
+    }
+
+    /// A matched-but-empty value (`""`) must never be reported as "no elements
+    /// matched" — that misdiagnosis sent users hunting for a different selector
+    /// on an element that resolved fine.
+    #[test]
+    fn get_matched_but_empty_message_keeps_the_value_contract() {
+        let attr = get_matched_but_empty_diagnostic_lines("attr", "#first-name", "data-bogus-xyz")
+            .join("\n");
+        assert!(attr.contains("Element matched \"#first-name\""), "got: {attr}");
+        assert!(attr.contains("attribute 'data-bogus-xyz' is empty or absent"), "got: {attr}");
+        assert!(!attr.contains("No elements matched"), "got: {attr}");
+        assert!(!attr.contains("selector may be too narrow"), "got: {attr}");
+        assert!(attr.contains("`null` = no match"), "got: {attr}");
+
+        let property =
+            get_matched_but_empty_diagnostic_lines("property", "#phone-number", "value").join("\n");
+        assert!(property.contains("Element matched \"#phone-number\""), "got: {property}");
+        assert!(property.contains("property 'value' is empty"), "got: {property}");
+        assert!(!property.contains("No elements matched"), "got: {property}");
     }
 
     #[test]
@@ -30978,6 +32831,63 @@ mod tests {
         assert_eq!(request["capabilities"]["profileMode"], json!("SEQUENTIAL"));
     }
 
+    // -----------------------------------------------------------------------
+    // swam list / swarm create display fixes
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn format_swarm_window_uses_local_time_with_a_date() {
+        let started = DateTime::parse_from_rfc3339("2026-10-13T17:12:05Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let finished = DateTime::parse_from_rfc3339("2026-10-13T17:13:09Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let window = format_swarm_window(started, finished);
+
+        // Same time base as the task rows (chrono::Local), with the date so a
+        // window that crosses midnight cannot be misread.
+        let expected_start = started
+            .with_timezone(&Local)
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        let expected_end = finished
+            .with_timezone(&Local)
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        assert_eq!(window, format!("{expected_start} -> {expected_end}"));
+        assert!(window.contains('-'), "the date must be part of the window: {window}");
+    }
+
+    #[test]
+    fn swarm_window_label_distinguishes_a_batch_from_all_tracked_tasks() {
+        assert_eq!(swarm_window_label(true), "Batch window (local)");
+        assert_eq!(swarm_window_label(false), "Tracked window (local)");
+        // The zone is always stated: an unlabeled window is what produced the
+        // 8-hour mismatch inside one output.
+        assert!(swarm_window_label(true).contains("local"));
+        assert!(swarm_window_label(false).contains("local"));
+    }
+
+    #[test]
+    fn auto_cleaned_swarm_tasks_message_names_every_removed_task() {
+        let entry = |id: &str| state::AsyncTaskEntry {
+            task_id: id.to_string(),
+            command: "swarm-submit".to_string(),
+            ..Default::default()
+        };
+        let message = auto_cleaned_swarm_tasks_message(&[
+            entry("71eb6240"),
+            entry("a1b2c3d4"),
+        ]);
+        assert!(message.contains("Auto-cleaned 2 completed swarm task(s)"), "{message}");
+        assert!(message.contains("71eb6240"), "{message}");
+        assert!(message.contains("a1b2c3d4"), "{message}");
+        // The non-interactive auto-clean must be discoverable from the message.
+        assert!(message.contains("non-interactive auto-clean"), "{message}");
+        assert!(!message.contains('\n'), "keep it one line: {message}");
+    }
+
     #[test]
     fn should_reuse_open_session_for_default_when_any_session_id_is_saved() {
         assert!(should_reuse_open_session(Some("default"), None));
@@ -31075,6 +32985,64 @@ mod tests {
         assert!(message.contains("🧾 Details"));
         assert!(!message.contains("open <url>` to refresh the session"));
         assert!(!message.contains("BROWSER4_CLI_NAVIGATION_TIMEOUT_SECS"));
+    }
+
+    // -----------------------------------------------------------------------
+    // chrome-error navigation (offline emulation) tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_chrome_error_url_detects_the_error_interstitial() {
+        assert!(is_chrome_error_url("chrome-error://chromewebdata/"));
+        assert!(is_chrome_error_url("  CHROME-ERROR://chromewebdata/ "));
+        assert!(!is_chrome_error_url("about:blank"));
+        assert!(!is_chrome_error_url("http://localhost:18080/x"));
+        assert!(!is_chrome_error_url(""));
+    }
+
+    #[test]
+    fn format_browser_error_page_message_reports_the_error_and_never_says_page_loaded() {
+        let message = format_browser_error_page_message(
+            "http://example.com/offline",
+            "chrome-error://chromewebdata/",
+            Some("ERR_INTERNET_DISCONNECTED"),
+            Some("example.com"),
+            Some("This site can’t be reached"),
+        );
+        assert!(message.contains("❌ Navigation failed"), "{message}");
+        assert!(message.contains("http://example.com/offline"), "{message}");
+        assert!(message.contains("chrome-error://chromewebdata/"), "{message}");
+        assert!(message.contains("ERR_INTERNET_DISCONNECTED"), "{message}");
+        assert!(message.contains("This site can’t be reached"), "{message}");
+        // The success hint must never accompany an error page.
+        assert!(!message.contains("Page loaded"), "{message}");
+        assert!(!message.contains("Navigate to"), "{message}");
+
+        // A probe that returned nothing still produces the honest failure.
+        let bare = format_browser_error_page_message(
+            "http://example.com/offline",
+            "chrome-error://chromewebdata/",
+            None,
+            None,
+            None,
+        );
+        assert!(bare.contains("❌ Navigation failed"), "{bare}");
+        assert!(!bare.contains("Browser error:"), "{bare}");
+        assert!(!bare.contains("Page text:"), "{bare}");
+    }
+
+    #[test]
+    fn format_browser_error_page_message_ignores_blank_probe_fields() {
+        let message = format_browser_error_page_message(
+            "http://example.com/",
+            "chrome-error://chromewebdata/",
+            Some(""),
+            Some("   "),
+            Some(""),
+        );
+        assert!(!message.contains("Browser error:"), "{message}");
+        assert!(!message.contains("Page title:"), "{message}");
+        assert!(!message.contains("Page text:"), "{message}");
     }
 
     #[test]
@@ -31340,6 +33308,7 @@ mod tests {
             "network-request",
             "network-route",
             "network-unroute",
+            "network-routes",
             "har-start",
             "har-stop",
         ] {
@@ -31350,6 +33319,32 @@ mod tests {
         }
         // download only configures the browser's download behavior — no page needed.
         assert!(!is_page_dependent_command("download"));
+    }
+
+    // -----------------------------------------------------------------------
+    // backend_unreachable_message tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn backend_unreachable_message_names_endpoint_and_does_not_blame_the_session() {
+        let message = backend_unreachable_message(
+            "http://127.0.0.1:8285/",
+            "fill",
+            "Failed to start Browser4 server on port 8285",
+        );
+        // The endpoint must be named (host:port), with no trailing slash noise.
+        assert!(message.contains("http://127.0.0.1:8285"), "{message}");
+        assert!(!message.contains("8285/"), "{message}");
+        // The launcher's own error is carried verbatim.
+        assert!(
+            message.contains("Cause: Failed to start Browser4 server on port 8285"),
+            "{message}"
+        );
+        // It must not send the user looking for a missing page/session.
+        assert!(!message.contains("No active browser session"), "{message}");
+        assert!(message.contains("page/tab state is lost"), "{message}");
+        // It should still tell the user how to load a page again.
+        assert!(message.contains("open <url>"), "{message}");
     }
 
     // -----------------------------------------------------------------------
@@ -32342,11 +34337,44 @@ mod tests {
             &example_args(&["100", "200", "--help", "--examples"]),
         ));
 
-        assert_eq!(
-            report,
-            "No examples available for 'mousemove' — is the backend running?"
+        // A failed request is the one case where "is the backend running?" is
+        // the honest diagnosis; the failing endpoint must be named.
+        assert!(
+            report.starts_with("No examples available for 'mousemove' — is the backend running? ("),
+            "report: {report}"
         );
+        assert!(report.contains("/mcp/tools/specs"), "report: {report}");
         assert_eq!(report.lines().count(), 1, "must be one line: {report}");
+    }
+
+    /// HTTP 200 with an empty spec list is the *normal* answer on a stock
+    /// install (`/mcp/tools/specs` only lists plugin-declared CLI commands) and
+    /// must not be reported as a backend outage.
+    #[test]
+    fn examples_empty_spec_list_does_not_blame_the_backend() {
+        let no_specs = spawn_status_mock_server("200 OK", r#"{"tools":[]}"#);
+        let report = block_on(build_command_examples(
+            &no_specs,
+            "click",
+            &example_args(&["e5", "--help", "--examples"]),
+        ));
+
+        assert!(
+            report.starts_with("Examples for browser4-cli click (built into the CLI):"),
+            "report: {report}"
+        );
+        assert!(
+            report.contains("Tool-level examples are unavailable: the backend is running"),
+            "report: {report}"
+        );
+        assert!(
+            report.contains("advertises no tool-level examples"),
+            "report: {report}"
+        );
+        assert!(
+            !report.contains("is the backend running?"),
+            "a healthy backend must not be reported as down: {report}"
+        );
     }
 
     #[test]
@@ -32640,6 +34668,31 @@ mod tests {
         for unsafe_sel in ["a'b", "a\"b", "a$b", "a`b", "a\\b"] {
             assert!(!sql_suggestion_safe(unsafe_sel), "must reject {unsafe_sel:?}");
         }
+    }
+
+    /// Every "Try these next" attribute suggestion must be a command that
+    /// returns ALL matches: single `get attr` silently returns only the first
+    /// one (and ignores `--limit`), which is what made a copied suggestion
+    /// produce partial data.
+    #[test]
+    fn htmlsnapshot_attr_suggestions_use_get_all() {
+        let lines = htmlsnapshot_attr_suggestion_lines();
+        assert_eq!(lines.len(), 3, "image, link and large-image hints");
+        for line in lines {
+            let command = line.trim();
+            assert!(
+                command.starts_with("htmlsnapshot get all attr "),
+                "suggestion must use `get all attr`: {command}"
+            );
+            assert!(
+                !command.starts_with("htmlsnapshot get attr "),
+                "single `get attr` returns only the first match: {command}"
+            );
+            assert!(command.contains("--limit 20"), "limit must be explicit: {command}");
+        }
+        assert!(lines.iter().any(|l| l.contains("img[src]")));
+        assert!(lines.iter().any(|l| l.contains("a[href]")));
+        assert!(lines.iter().any(|l| l.contains("large images")));
     }
 
     #[test]
@@ -34010,6 +36063,62 @@ mod tests {
         std::fs::write(state_dir.join("sessions").join("broken.json"), "not json").unwrap();
 
         assert!(collect_namespace_sessions(state_dir, None).is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // list: live URL fallback for Active sessions
+    // -----------------------------------------------------------------------
+
+    fn session_row(name: &str, url: &str, status: &str) -> SessionRow {
+        SessionRow {
+            name: name.to_string(),
+            session_id: format!("id-{name}"),
+            url: url.to_string(),
+            status: status.to_string(),
+            display: "Headless".to_string(),
+            created: String::new(),
+            last_access: String::new(),
+            connection: "Browser4".to_string(),
+            next_open: "Reuse".to_string(),
+        }
+    }
+
+    #[test]
+    fn row_needs_live_url_only_for_active_rows_without_a_url() {
+        // The bug: an Active session with a live page rendered "-", which the
+        // docs reserve for "unreachable/stale".
+        assert!(row_needs_live_url(&session_row("ec-eval", "-", "Active")));
+        // A URL the backend already reported needs no extra round trip.
+        assert!(!row_needs_live_url(&session_row("ec-eval", "https://x/", "Active")));
+        // Stale/Unknown rows cannot be queried — their "-" is accurate.
+        assert!(!row_needs_live_url(&session_row("stale", "-", "Stale")));
+        assert!(!row_needs_live_url(&session_row("unknown", "-", "Unknown")));
+    }
+
+    #[test]
+    fn normalize_live_url_rejects_empty_and_pseudo_values() {
+        assert_eq!(normalize_live_url("https://example.com/a"), "https://example.com/a");
+        assert_eq!(normalize_live_url("  https://example.com/a \n"), "https://example.com/a");
+        // JSON-encoded payloads from some transports.
+        assert_eq!(normalize_live_url("\"https://example.com/a\""), "https://example.com/a");
+        // No usable URL → the caller must use the "?" marker, not "-".
+        assert_eq!(normalize_live_url(""), "");
+        assert_eq!(normalize_live_url("   "), "");
+        assert_eq!(normalize_live_url("null"), "");
+        assert_eq!(normalize_live_url("undefined"), "");
+        assert_eq!(normalize_live_url("-"), "");
+        // about:blank is a real tab URL and must survive.
+        assert_eq!(normalize_live_url("about:blank"), "about:blank");
+    }
+
+    #[test]
+    fn session_url_unknown_note_is_one_line_and_distinguishes_the_markers() {
+        let note = session_url_unknown_note();
+        assert!(!note.contains('\n'), "the note must stay one line: {note}");
+        assert!(note.contains("'?'"), "{note}");
+        assert!(note.contains("'-'"), "{note}");
+        assert!(note.contains("stale"), "{note}");
+        assert_ne!(SESSION_URL_UNKNOWN, "-");
     }
 
     // -----------------------------------------------------------------------
@@ -35640,6 +37749,116 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // wait timeout classification tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn classify_wait_outcome_reads_negative_codes_and_null_as_timeouts() {
+        // The backend's failure encodings observed in the issue report.
+        assert_eq!(
+            classify_wait_outcome("wait_for_selector", "-6"),
+            WaitOutcome::TimedOut(Some(-6))
+        );
+        assert_eq!(
+            classify_wait_outcome("wait_for_selector", "-8"),
+            WaitOutcome::TimedOut(Some(-8))
+        );
+        assert_eq!(
+            classify_wait_outcome("wait_for_function", "null"),
+            WaitOutcome::TimedOut(None)
+        );
+        assert_eq!(
+            classify_wait_outcome("wait_for_page", " null "),
+            WaitOutcome::TimedOut(None)
+        );
+    }
+
+    #[test]
+    fn classify_wait_outcome_reads_elapsed_millis_as_success() {
+        assert_eq!(
+            classify_wait_outcome("wait_for_selector", "1992"),
+            WaitOutcome::Satisfied(Some(1992))
+        );
+        // Quoted numbers come back from transports that JSON-encode the value.
+        assert_eq!(
+            classify_wait_outcome("wait_for_function", "\"8\""),
+            WaitOutcome::Satisfied(Some(8))
+        );
+        assert_eq!(
+            classify_wait_outcome("wait_for_page", "0"),
+            WaitOutcome::Satisfied(Some(0))
+        );
+    }
+
+    #[test]
+    fn classify_wait_outcome_keeps_non_timing_payloads_as_success() {
+        // Empty payloads and JSON objects must not start failing waits: mock
+        // transports and the network-idle probe answer with "{}"/"".
+        assert_eq!(classify_wait_outcome("wait_for_selector", ""), WaitOutcome::Unknown);
+        assert_eq!(classify_wait_outcome("wait_for_function", "{}"), WaitOutcome::Unknown);
+        assert_eq!(
+            classify_wait_outcome("wait_for_function", "{\"type\":\"Driver\"}"),
+            WaitOutcome::Unknown
+        );
+        // `delay` always completes, whatever the transport reports.
+        assert_eq!(classify_wait_outcome("delay", ""), WaitOutcome::Satisfied(None));
+    }
+
+    #[test]
+    fn wait_timeout_message_names_target_and_timeout() {
+        let selector = wait_timeout_message(
+            "wait_for_selector",
+            &json!({"selector": "#nope-42", "timeoutMillis": 4000}),
+        );
+        assert_eq!(selector, "Timed out: element '#nope-42' not found within 4000ms.");
+        assert!(selector.contains("#nope-42") && selector.contains("4000"));
+
+        let url = wait_timeout_message(
+            "wait_for_page",
+            &json!({"url": "**/never-matches-this-xyz", "timeoutMillis": 2500}),
+        );
+        assert_eq!(url, "Timed out: URL did not match '**/never-matches-this-xyz' within 2500ms.");
+
+        let function = wait_timeout_message(
+            "wait_for_function",
+            &json!({"pageFunction": "false", "timeoutMillis": 3000}),
+        );
+        assert_eq!(function, "Timed out: condition 'false' never became true within 3000ms.");
+    }
+
+    #[test]
+    fn wait_timeout_message_truncates_long_scripts_and_reports_missing_timeout() {
+        let long_script = format!("const xs = document.querySelectorAll('h1');\n{}", "x".repeat(500));
+        let message =
+            wait_timeout_message("wait_for_function", &json!({"pageFunction": long_script}));
+        assert_eq!(
+            message,
+            "Timed out: condition 'const xs = document.querySelectorAll('h1');…' never became true."
+        );
+        assert!(message.len() < 160, "message should stay one line: {message}");
+
+        let network = wait_timeout_message(
+            "wait_for_function",
+            &json!({
+                "pageFunction": commands::load_strategy_js("networkidle").unwrap(),
+                "timeoutMillis": 5000
+            }),
+        );
+        assert_eq!(network, "Timed out: network did not go idle within 5000ms.");
+    }
+
+    #[test]
+    fn summarize_wait_target_shortens_multiline_scripts() {
+        assert_eq!(summarize_wait_target("false"), "false");
+        assert_eq!(summarize_wait_target("  a  \n b"), "a…");
+        assert_eq!(summarize_wait_target(""), "");
+        let long = "y".repeat(200);
+        let shortened = summarize_wait_target(&long);
+        assert!(shortened.ends_with('…'));
+        assert_eq!(shortened.chars().count(), 81);
+    }
+
     #[test]
     fn is_network_idle_wait_detects_only_the_tracker_expression() {
         assert!(is_network_idle_wait(&json!({
@@ -35815,6 +38034,125 @@ mod tests {
     }
 
     #[test]
+    fn parse_block_probe_reads_the_interactive_node_count() {
+        let probe = parse_block_probe(
+            r#"{"url":"http://localhost:18080/x","text":"tiny","iframes":0,"interactive":4}"#,
+        )
+        .unwrap();
+        assert_eq!(probe.interactive_count, 4);
+        // Older payloads without the field degrade to "unknown" (0), not to an
+        // accidental suppression of the signal.
+        let legacy = parse_block_probe(r#"{"url":"https://example.com/","iframes":2}"#).unwrap();
+        assert_eq!(legacy.interactive_count, 0);
+        assert_eq!(legacy.iframe_count, 2);
+    }
+
+    #[test]
+    fn host_is_private_or_loopback_matches_loopback_and_rfc1918() {
+        for url in [
+            "http://localhost:18080/assets/consolelog.html",
+            "http://localhost/",
+            "https://app.localhost/",
+            "http://127.0.0.1:18080/",
+            "http://127.1.2.3/",
+            "http://[::1]:18080/",
+            "http://0.0.0.0:8080/",
+            "http://10.0.0.5/",
+            "http://192.168.1.10/page",
+            "http://172.16.0.1/",
+            "http://172.31.255.254/",
+            "http://user:pass@localhost:18080/",
+        ] {
+            assert!(host_is_private_or_loopback(url), "{url} should be private/loopback");
+        }
+        for url in [
+            "https://example.com/",
+            "http://172.32.0.1/",
+            "http://172.15.0.1/",
+            "http://11.0.0.1/",
+            "http://192.169.0.1/",
+            "chrome-error://chromewebdata/",
+            "",
+        ] {
+            assert!(!host_is_private_or_loopback(url), "{url} should not be private/loopback");
+        }
+    }
+
+    #[test]
+    fn detect_block_signature_full_exempts_private_hosts_from_empty_body() {
+        // Regression for the reported false positive: minimal localhost
+        // fixtures are not challenge pages.
+        assert_eq!(
+            detect_block_signature_full("http://localhost:18080/assets/consolelog.html", "16 chars here", 0, 0),
+            None
+        );
+        assert_eq!(
+            detect_block_signature_full("http://127.0.0.1:18080/assets/error.html", "", 0, 0),
+            None
+        );
+        assert_eq!(
+            detect_block_signature_full("http://192.168.1.7/tiny.html", "tiny", 0, 0),
+            None
+        );
+        // A real challenge URL marker on a local host is still reported.
+        assert_eq!(
+            detect_block_signature_full("http://localhost:18080/captcha", "", 0, 0),
+            Some(BlockSignature::Url("/captcha"))
+        );
+    }
+
+    #[test]
+    fn detect_block_signature_full_exempts_pages_with_interactive_nodes() {
+        // A page that rendered controls is not an empty shell, even when its
+        // visible text is short.
+        assert_eq!(
+            detect_block_signature_full("https://example.com/", "short", 0, 3),
+            None
+        );
+        // No interactive nodes and a public host → the weak signal still fires.
+        assert_eq!(
+            detect_block_signature_full("https://example.com/", "short", 0, 0),
+            Some(BlockSignature::EmptyBody(5))
+        );
+    }
+
+    #[test]
+    fn snapshot_interactive_nodes_suppress_the_empty_body_signal() {
+        // A snapshot that just listed controls disproves the heuristic.
+        SNAPSHOT_INTERACTIVE_NODES.with(|cell| cell.set(None));
+        assert_eq!(
+            detect_block_signature_full("https://example.com/", "short", 0, 0),
+            Some(BlockSignature::EmptyBody(5))
+        );
+        record_snapshot_interactive_nodes(
+            "- generic [ref=e1]\n- button \"Buy\" [ref=e2]\n- link \"Home\" [ref=e3]",
+        );
+        assert!(snapshot_confirmed_interactive_nodes());
+        assert_eq!(
+            detect_block_signature_full("https://example.com/", "short", 0, 0),
+            None
+        );
+        // A snapshot with no refs proves nothing and must not suppress.
+        record_snapshot_interactive_nodes("- generic:\n- text: hello");
+        assert!(!snapshot_confirmed_interactive_nodes());
+        assert_eq!(
+            detect_block_signature_full("https://example.com/", "short", 0, 0),
+            Some(BlockSignature::EmptyBody(5))
+        );
+        SNAPSHOT_INTERACTIVE_NODES.with(|cell| cell.set(None));
+    }
+
+    #[test]
+    fn count_snapshot_interactive_nodes_counts_ref_lines() {
+        assert_eq!(count_snapshot_interactive_nodes(""), 0);
+        assert_eq!(count_snapshot_interactive_nodes("- text: hello"), 0);
+        assert_eq!(
+            count_snapshot_interactive_nodes("- link \"A\" [ref=e1]\n- link \"B\" [ref=e2]"),
+            2
+        );
+    }
+
+    #[test]
     fn format_block_warning_names_the_signature_and_the_escalation() {
         let warning = format_block_warning(&BlockSignature::Url("/sorry"));
         assert!(warning.contains("/sorry"));
@@ -35856,12 +38194,12 @@ mod tests {
         // Regression for the reCAPTCHA demo false positive: a widget demo page
         // whose visible text lives inside iframes is not an empty-body challenge.
         assert_eq!(
-            detect_block_signature_full("https://www.google.com/recaptcha/api2/demo", "demo", 1),
+            detect_block_signature_full("https://www.google.com/recaptcha/api2/demo", "demo", 1, 0),
             None
         );
         // Without iframes the same near-empty page is flagged.
         assert_eq!(
-            detect_block_signature_full("https://www.google.com/recaptcha/api2/demo", "demo", 0),
+            detect_block_signature_full("https://www.google.com/recaptcha/api2/demo", "demo", 0, 0),
             Some(BlockSignature::EmptyBody(4))
         );
     }
@@ -37277,6 +39615,269 @@ mod tests {
         assert!(err.message().contains("No URLs provided"), "got: {err}");
     }
 
+    // ------------------------------------------------------------------
+    // set geo — the permission grant that makes the override observable
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn url_origin_keeps_scheme_host_and_port_only() {
+        assert_eq!(
+            url_origin("https://example.com/a/b?c=1#d"),
+            Some("https://example.com".to_string())
+        );
+        assert_eq!(
+            url_origin("http://localhost:18080/generated/interactive-5.html"),
+            Some("http://localhost:18080".to_string())
+        );
+        // A non-default port is part of the origin: granting the permission for
+        // "http://localhost" would not cover a page served on :18080.
+        assert_eq!(
+            url_origin("HTTP://Example.COM:8080").map(|o| o.to_ascii_lowercase()),
+            Some("http://example.com:8080".to_string())
+        );
+    }
+
+    #[test]
+    fn url_origin_is_none_without_an_authority() {
+        assert_eq!(url_origin(""), None);
+        assert_eq!(url_origin("about:blank"), None);
+        assert_eq!(url_origin("https://"), None);
+        assert_eq!(url_origin("chrome-error://chromewebdata/"), None);
+    }
+
+    // ------------------------------------------------------------------
+    // --fail-on-false — the assertion exit-code contract
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn assertion_verdict_reads_the_transported_forms() {
+        // The tool result travels as text: cover the plain, quoted and enveloped
+        // boolean forms the backends have used.
+        assert_eq!(parse_assertion_verdict("true"), Some(true));
+        assert_eq!(parse_assertion_verdict("false"), Some(false));
+        assert_eq!(parse_assertion_verdict("  TRUE  "), Some(true));
+        assert_eq!(parse_assertion_verdict("\"false\""), Some(false));
+        assert_eq!(parse_assertion_verdict(r#"{"result": true}"#), Some(true));
+        assert_eq!(parse_assertion_verdict(r#"{"result": "false"}"#), Some(false));
+    }
+
+    #[test]
+    fn assertion_verdict_is_none_when_nothing_answered() {
+        // A missing element answers null/empty — that is not `false` and it is not
+        // a pass, so `--fail-on-false` must fail on it (see the dispatch arm).
+        assert_eq!(parse_assertion_verdict(""), None);
+        assert_eq!(parse_assertion_verdict("   "), None);
+        assert_eq!(parse_assertion_verdict("null"), None);
+        assert_eq!(parse_assertion_verdict(r#"{"result": null}"#), None);
+        // A backend error is not a verdict either.
+        assert_eq!(parse_assertion_verdict("BrowserProtocol error"), None);
+    }
+
+    #[test]
+    fn only_the_assertion_commands_take_the_verdict_path() {
+        assert!(is_assertion_command("is-visible"));
+        assert!(is_assertion_command("is-enabled"));
+        assert!(is_assertion_command("is-checked"));
+        // The read commands print a value; they are not verdicts.
+        assert!(!is_assertion_command("get"));
+        assert!(!is_assertion_command("is"));
+        assert!(!is_assertion_command("snapshot"));
+    }
+
+    // ------------------------------------------------------------------
+    // set <mode> — the confirmation that replaced a bare `{}`
+    // ------------------------------------------------------------------
+
+    // ------------------------------------------------------------------
+    // frames / frame — the tree and scope confirmation
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn frames_render_as_a_tree_with_the_active_marker() {
+        let raw = r#"[
+            {"id":"F1","name":"","url":"https://shop.example/checkout","parentId":null,"depth":0,"active":false},
+            {"id":"F2","name":"payframe","url":"https://pay.example/pay","parentId":"F1","depth":1,"active":true}
+        ]"#;
+
+        let tree = render_frame_tree(raw);
+
+        assert!(tree.contains("Frames (depth-first"), "{tree}");
+        // The main frame gets no indent, the child one level.
+        assert!(tree.contains("- (unnamed) — https://shop.example/checkout (id=F1)"), "{tree}");
+        assert!(tree.contains("  └ payframe [active] — https://pay.example/pay (id=F2)"), "{tree}");
+    }
+
+    #[test]
+    fn frames_renderer_passes_through_what_it_cannot_parse() {
+        // A rendering convenience must never hide the real payload.
+        let not_json = "F1 main\n  F2 payframe";
+        assert_eq!(render_frame_tree(not_json), not_json);
+        assert_eq!(
+            render_frame_tree("[]"),
+            "No frames reported (the page has no iframes)."
+        );
+        assert_eq!(
+            render_frame_tree(""),
+            "No frames reported (the page has no iframes)."
+        );
+    }
+
+    #[test]
+    fn frame_scope_is_described_from_the_switch_result() {
+        let switched = r#"{"id":"F2","name":"payframe","url":"https://pay.example/pay","active":true}"#;
+        assert_eq!(
+            describe_frame_scope(switched).as_deref(),
+            Some("payframe — https://pay.example/pay")
+        );
+        // Nested under a "frame" key, unnamed, or without a usable handle.
+        assert_eq!(
+            describe_frame_scope(r#"{"frame":{"url":"https://pay.example/pay"}}"#).as_deref(),
+            Some("https://pay.example/pay")
+        );
+        assert_eq!(describe_frame_scope(r#"{"id":"F3"}"#).as_deref(), Some("id=F3"));
+        assert_eq!(describe_frame_scope("{}"), None);
+        assert_eq!(describe_frame_scope("not json"), None);
+    }
+
+    // ------------------------------------------------------------------
+    // network routes — the read-only listing
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn network_routes_list_the_action_that_distinguishes_them() {
+        let raw = r#"[
+            {"pattern":"**/api/users","action":"abort","resourceTypes":[]},
+            {"pattern":"**/api/config","action":"body","contentType":"application/json","resourceTypes":["xhr","fetch"]}
+        ]"#;
+
+        let table = render_network_routes(raw);
+
+        assert!(table.contains("Request routes (2 registered)"), "{table}");
+        assert!(table.contains("abort") && table.contains("**/api/users"), "{table}");
+        assert!(table.contains("body") && table.contains("**/api/config"), "{table}");
+        assert!(table.contains("[mock: application/json]"), "{table}");
+        assert!(table.contains("[types: xhr,fetch]"), "{table}");
+        assert!(table.contains("network unroute"), "the removal hint must be present: {table}");
+    }
+
+    #[test]
+    fn network_routes_renderer_handles_empty_and_unparsable_input() {
+        assert!(render_network_routes("[]").contains("No request routes are registered"));
+        assert!(render_network_routes("").contains("No request routes are registered"));
+        assert_eq!(render_network_routes("not json"), "not json");
+    }
+
+    // ------------------------------------------------------------------
+    // network requests — the compact table
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn network_requests_render_as_a_compact_table() {
+        let raw = r#"[
+            {"requestId":"100.1","url":"https://api.example.com/users","method":"GET","resourceType":"XHR","status":200},
+            {"requestId":"100.2","url":"https://api.example.com/login","method":"POST","resourceType":"Fetch","status":401}
+        ]"#;
+
+        let table = render_network_requests(raw, None);
+
+        assert!(table.contains("Network requests: 2 tracked"), "{table}");
+        assert!(table.contains("200") && table.contains("GET") && table.contains("XHR"), "{table}");
+        assert!(table.contains("POST") && table.contains("401"), "{table}");
+        assert!(table.contains("[100.1]"), "the id must be visible for `network request <id>`: {table}");
+        // Headers are not dumped: one line per request is the point.
+        assert!(!table.contains("requestHeaders"), "{table}");
+        assert!(!table.contains("\"value\""), "{table}");
+    }
+
+    #[test]
+    fn network_requests_limit_keeps_the_newest_and_reports_the_total() {
+        let raw = r#"[
+            {"requestId":"1","url":"https://a/1","method":"GET","resourceType":"XHR","status":200},
+            {"requestId":"2","url":"https://a/2","method":"GET","resourceType":"XHR","status":200},
+            {"requestId":"3","url":"https://a/3","method":"GET","resourceType":"XHR","status":200}
+        ]"#;
+
+        let table = render_network_requests(raw, Some(2));
+
+        assert!(table.contains("3 tracked, showing the newest 2"), "{table}");
+        assert!(!table.contains("https://a/1"), "the oldest row must be dropped: {table}");
+        assert!(table.contains("https://a/3"), "{table}");
+    }
+
+    #[test]
+    fn network_requests_renderer_passes_through_what_it_cannot_parse() {
+        assert!(render_network_requests("", None).contains("No network requests tracked"));
+        assert!(render_network_requests("[]", None).contains("No network requests tracked"));
+        assert_eq!(render_network_requests("not json", None), "not json");
+        assert_eq!(count_network_entries(r#"[{"a":1},{"a":2}]"#), 2);
+        assert_eq!(count_network_entries("not json"), 0);
+    }
+
+    #[test]
+    fn set_confirmation_names_what_was_applied() {
+        let geo = json!({
+            "method": "Emulation.setGeolocationOverride",
+            "params": { "latitude": 31.23, "longitude": 121.47, "accuracy": 1.0 },
+        });
+        let line = describe_cdp_application(&geo).expect("geo must be described");
+        assert!(line.contains("latitude=31.23"), "{line}");
+        assert!(line.contains("longitude=121.47"), "{line}");
+        assert!(line.contains("accuracy=1 m"), "{line}");
+
+        let offline = json!({
+            "method": "Network.emulateNetworkConditions",
+            "params": { "offline": true, "latency": 0, "downloadThroughput": -1, "uploadThroughput": -1 },
+        });
+        assert_eq!(
+            describe_cdp_application(&offline).as_deref(),
+            Some("Network emulation: offline=on")
+        );
+
+        // A device override must say the metrics will not survive navigation: the
+        // user otherwise cannot explain why the emulation vanished after `goto`.
+        let device = json!({
+            "method": "Emulation.setDeviceMetricsOverride",
+            "params": { "width": 390.0, "height": 844.0, "deviceScaleFactor": 2.0, "mobile": true },
+        });
+        let line = describe_cdp_application(&device).expect("device must be described");
+        assert!(line.contains("390x844 @dpr 2"), "{line}");
+        assert!(line.contains("mobile=true"), "{line}");
+        assert!(line.contains("goto"), "the persistence caveat must be stated: {line}");
+
+        let headers = json!({
+            "method": "Network.setExtraHTTPHeaders",
+            "params": { "headers": { "X-A": "1", "X-B": "2" } },
+        });
+        assert_eq!(
+            describe_cdp_application(&headers).as_deref(),
+            Some("Extra HTTP headers set: 2 header(s)")
+        );
+
+        // An unknown CDP method is not described — the caller names the mode.
+        let other = json!({ "method": "Page.enable", "params": {} });
+        assert_eq!(describe_cdp_application(&other), None);
+        assert_eq!(describe_cdp_application(&json!({})), None);
+    }
+
+    #[test]
+    fn only_the_geolocation_override_triggers_the_permission_grant() {        let geo = json!({
+            "method": "Emulation.setGeolocationOverride",
+            "params": { "latitude": 1.0, "longitude": 2.0, "accuracy": 1.0 },
+        });
+        assert!(is_geolocation_override(&geo));
+
+        for other in [
+            json!({ "method": "Network.emulateNetworkConditions", "params": {} }),
+            json!({ "method": "Emulation.setDeviceMetricsOverride", "params": {} }),
+            json!({ "params": {} }),
+        ] {
+            assert!(
+                !is_geolocation_override(&other),
+                "the grant must not follow {other}"
+            );
+        }
+    }
+
     #[test]
     fn resolve_crawl_urls_seed_with_only_comments_errors() {
         let result = resolve_crawl_urls("", Some(("urls.txt", "# just a comment\n# another")));
@@ -37379,6 +39980,25 @@ mod tests {
             refusal
         );
         assert_eq!(None, crawl_seed_refusal("https://example.com", "command argument"));
+    }
+
+    /// Regression for the "did you mean 'https://…'?." double terminator: the
+    /// sentence period must be omitted when the problem already ends with
+    /// terminal punctuation.
+    #[test]
+    fn crawl_seed_refusal_does_not_double_the_terminator_after_a_hint() {
+        let refusal = crawl_seed_refusal("not-a-url.example.com", "seeds.txt line 4")
+            .expect("a schemeless host is refused");
+        assert!(
+            refusal.contains("did you mean 'https://not-a-url.example.com'?"),
+            "got: {refusal}"
+        );
+        assert!(!refusal.contains("?."), "double terminator in: {refusal}");
+        assert!(refusal.ends_with('?'), "got: {refusal}");
+        // The plain problem keeps its period.
+        let plain = crawl_seed_refusal("formats", "command argument").expect("a refusal");
+        assert!(plain.ends_with('.'), "got: {plain}");
+        assert!(!plain.ends_with(".."), "got: {plain}");
     }
 
     #[test]
@@ -40278,6 +42898,22 @@ mod tests {
         // Plain-text failures are unchanged content and rely on the envelope's
         // "completed": false marker (checked before unwrapping).
         assert!(!detect_empty_extraction("Extract failed: boom"));
+    }
+
+    /// `extract --stdout` on an empty payload must explain itself and fail:
+    /// stdout keeps the pure-JSON payload, the diagnostic goes to the error
+    /// channel, and the exit code is non-zero.
+    #[test]
+    fn empty_extraction_stdout_error_explains_the_failure() {
+        let message = empty_extraction_stdout_error("{}", "/tmp/extract.txt");
+        assert!(message.contains("Extraction produced no data"), "got: {message}");
+        assert!(message.contains("{}"), "the payload is echoed: {message}");
+        assert!(message.contains("/tmp/extract.txt"), "got: {message}");
+        assert!(message.contains("eval"), "a fallback is offered: {message}");
+        assert!(message.contains("htmlsnapshot get"), "got: {message}");
+        // An empty string is rendered explicitly instead of producing a blank.
+        let blank = empty_extraction_stdout_error("   ", "/tmp/extract.txt");
+        assert!(blank.contains("<empty>"), "got: {blank}");
     }
 
     // ── MSYS path-conversion guard ─────────────────────────────────────────

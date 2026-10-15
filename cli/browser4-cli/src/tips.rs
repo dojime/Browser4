@@ -508,6 +508,7 @@ fn tips_for_command(command: &str) -> &'static [Tip] {
         | "webminer-views" => TIPS_WEBMINER,
         "attach" => TIPS_ATTACH,
         "network-requests" | "network-request" | "network-route" | "network-unroute"
+        | "network-routes"
         | "har-start" | "har-stop" => TIPS_NETWORK,
         "cookie-list" | "cookie-get" | "cookie-set" | "cookie-delete" | "cookie-clear" => {
             TIPS_COOKIE

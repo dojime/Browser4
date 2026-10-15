@@ -11,11 +11,14 @@ import ai.platon.pulsar.agentic.tools.CustomToolRegistry
 import ai.platon.pulsar.agentic.tools.ToolRateLimiter
 import ai.platon.pulsar.agentic.tools.ToolResultCache
 import ai.platon.pulsar.agentic.tools.ToolErrorCode
+import ai.platon.pulsar.agentic.tools.TargetNotFoundException
 import ai.platon.pulsar.agentic.tools.advanced.format.FormatDegradation
 import ai.platon.pulsar.agentic.tools.advanced.format.FormatFailureException
 import ai.platon.pulsar.agentic.tools.builtin.AbstractToolExecutor
 import ai.platon.pulsar.agentic.tools.builtin.ToolExecutor
 import ai.platon.pulsar.agentic.tools.advanced.agent.StatefulAgentRunner
+import ai.platon.pulsar.api.model.WebDriverException
+import ai.platon.pulsar.chrome.Browser4WebDriver
 import ai.platon.pulsar.rest.session.ManagedSession
 import ai.platon.pulsar.rest.session.PulsarSessionManager
 import ai.platon.pulsar.rest.session.SessionKind
@@ -2397,5 +2400,200 @@ class MCPToolControllerTest {
             java.util.concurrent.TimeoutException("nope"),
         )
         assertEquals("TIMEOUT", timeout.errorCode)
+    }
+
+    @Test
+    @DisplayName("a stale-ref failure is a not-found error, not a retryable timeout with a help dump")
+    fun staleRefIsNotFoundWithoutTheHelpDump() = runBlocking {
+        // Regression, found by a real run of `eval --ref e999`: the composed
+        // message carried the tool description, whose `waitTimeout` parameter
+        // matched the old substring timeout pattern — so a permanent not-found
+        // came back as a retryable TIMEOUT, with the signature dump attached as
+        // if the caller had misused the tool.
+        mockTool("tab", "evaluateValue")
+
+        `when`(agentToolManager.execute(any())).thenReturn(
+            toolCallResult(
+                evaluate = TcEvaluate(
+                    expression = "tab.evaluateValue(selector=\"e999\")",
+                    exception = TcException(
+                        expression = "tab.evaluateValue(selector=\"e999\")",
+                        cause = TargetNotFoundException(
+                            "Element not found for ref backend:999. Refs expire after page changes — " +
+                                "re-run `snapshot` to get fresh refs."
+                        ),
+                        help = "Evaluate JavaScript in the page. Arguments: waitTimeout: How long to wait."
+                    )
+                )
+            )
+        )
+
+        val result = controller.callTool(
+            MCPToolCallRequest(
+                tool = "browser_evaluate",
+                arguments = mapOf("sessionId" to sessionId, "expression" to "1")
+            ),
+            response
+        )
+
+        val body = result.body!!
+        val text = body.content[0].text
+        assertTrue(body.isError)
+        assertEquals("TARGET_NOT_FOUND", body.errorCode, text)
+        assertTrue(text.contains("Element not found for ref backend:999"), text)
+        assertFalse(text.contains("help:"), "a lookup miss must not carry the tool signature: $text")
+        assertFalse(text.contains("waitTimeout"), "the appended description must be gone: $text")
+        assertFalse(
+            ToolErrorCode.TARGET_NOT_FOUND.retryable,
+            "a stale ref never resolves by retrying the identical call"
+        )
+    }
+
+    @Test
+    @DisplayName("a lookup miss that arrives as a bad argument still gets no tool-help dump")
+    fun targetMissSignalledAsIllegalArgumentGetsNoHelpDump() = runBlocking {
+        // The driver reports some misses as IllegalArgumentException (e.g.
+        // selectOption's target probe). The call's shape was valid, so the
+        // signature/help block must stay out even though the type says "usage".
+        mockTool("tab", "evaluateValue")
+
+        `when`(agentToolManager.execute(any())).thenReturn(
+            toolCallResult(
+                evaluate = TcEvaluate(
+                    expression = "tab.evaluateValue(selector=\"#missing\")",
+                    exception = TcException(
+                        expression = "tab.evaluateValue(selector=\"#missing\")",
+                        cause = IllegalArgumentException("No element matches selector \"#missing\"."),
+                        help = "Evaluate JavaScript in the page."
+                    )
+                )
+            )
+        )
+
+        val result = controller.callTool(
+            MCPToolCallRequest(
+                tool = "browser_evaluate",
+                arguments = mapOf("sessionId" to sessionId, "expression" to "1")
+            ),
+            response
+        )
+
+        val text = result.body!!.content[0].text
+        assertEquals("TARGET_NOT_FOUND", result.body!!.errorCode, text)
+        assertFalse(text.contains("help:"), "a runtime lookup miss must not read as a usage error: $text")
+    }
+
+    @Test
+    @DisplayName("frame-scope recovery hints name the CLI commands, not the MCP methods")
+    fun frameHintsAreTranslatedToCliCommands() = runBlocking {
+        // The driver composes its frame errors for an API audience
+        // (`frameList()`, `frameMain()`); a CLI user has no such command to run.
+        mockTool("tab", "evaluateValue")
+
+        `when`(agentToolManager.execute(any())).thenReturn(
+            toolCallResult(
+                evaluate = TcEvaluate(
+                    expression = "tab.frameSwitch(frame=\"#no-such-frame\")",
+                    exception = TcException(
+                        expression = "tab.frameSwitch(frame=\"#no-such-frame\")",
+                        cause = WebDriverException(
+                            "Frame not found: #no-such-frame. List the page frames with `frameList()` and " +
+                                "switch by an element ref. Switch back to the main frame (`frameMain()`)."
+                        )
+                    )
+                )
+            )
+        )
+
+        val result = controller.callTool(
+            MCPToolCallRequest(
+                tool = "browser_evaluate",
+                arguments = mapOf("sessionId" to sessionId, "expression" to "1")
+            ),
+            response
+        )
+
+        val text = result.body!!.content[0].text
+        assertTrue(text.contains("List the page frames with `frames`"), text)
+        assertTrue(text.contains("(`frame main`)"), text)
+        assertFalse(text.contains("frameList()"), text)
+        assertFalse(text.contains("frameMain()"), text)
+        assertEquals("TARGET_NOT_FOUND", result.body!!.errorCode, text)
+    }
+
+    @Test
+    @DisplayName("a session-scoped tab tool fails fast while a native dialog is pending")
+    fun tabToolFailsFastWhileADialogIsPending() = runBlocking {
+        // Regression: the tool-layer dialog guard covers page-state reads but not
+        // the tab handlers, so tab-list waited out the client's whole HTTP
+        // timeout and then reported a network error.
+        val driver = Mockito.mock(Browser4WebDriver::class.java)
+        `when`(agenticSession.boundDriver).thenReturn(driver)
+        Mockito.doThrow(
+            IllegalStateException(
+                "Page is blocked by a native confirm dialog: \"Confirm action\". " +
+                    "Use dialog-accept or dialog-dismiss to handle the dialog before reading page state."
+            )
+        ).`when`(driver).requireNoPendingDialog()
+
+        val result = controller.callTool(
+            MCPToolCallRequest(
+                tool = "browser_tabs",
+                arguments = mapOf("action" to "list", "sessionId" to sessionId)
+            ),
+            response
+        )
+
+        val text = result.body!!.content[0].text
+        assertEquals("DIALOG_PENDING", result.body!!.errorCode, text)
+        assertTrue(text.contains("dialog-accept"), text)
+        Mockito.verify(agentToolManager, Mockito.never()).execute(any())
+    }
+
+    @Test
+    @DisplayName("list_sessions reports the live page URL of a bound driver")
+    fun listSessionsReportsTheLivePageUrl() = runBlocking {
+        val driver = Mockito.mock(WebDriver::class.java)
+        `when`(sessionManager.getAllSessions()).thenReturn(listOf(managedSession))
+        `when`(managedSession.sessionId).thenReturn(sessionId)
+        `when`(managedSession.status).thenReturn(SessionStatus.ACTIVE)
+        `when`(managedSession.kind).thenReturn(SessionKind.BROWSER4_LAUNCHED)
+        `when`(managedSession.capabilities).thenReturn(null)
+        // The stored field is never written by the backend; the live driver is
+        // the only source of a real URL.
+        `when`(managedSession.url).thenReturn(null)
+        `when`(agenticSession.boundDriver).thenReturn(driver)
+        `when`(driver.currentUrl()).thenReturn("https://live.example/page")
+        `when`(sessionManager.checkHealthy(managedSession)).thenReturn(CheckState(0))
+
+        val result = controller.callTool(MCPToolCallRequest(tool = "list_sessions"), response)
+
+        val text = result.body!!.content[0].text
+        assertTrue(text.contains(""""url":"https://live.example/page""""), text)
+    }
+
+    @Test
+    @DisplayName("list_sessions still answers when the bound driver is unreachable")
+    fun listSessionsSurvivesAnUnreachableDriver() = runBlocking {
+        val driver = Mockito.mock(WebDriver::class.java)
+        `when`(sessionManager.getAllSessions()).thenReturn(listOf(managedSession))
+        `when`(managedSession.sessionId).thenReturn(sessionId)
+        `when`(managedSession.status).thenReturn(SessionStatus.ACTIVE)
+        `when`(managedSession.kind).thenReturn(SessionKind.BROWSER4_LAUNCHED)
+        `when`(managedSession.capabilities).thenReturn(null)
+        `when`(managedSession.url).thenReturn(null)
+        `when`(agenticSession.boundDriver).thenReturn(driver)
+        `when`(driver.currentUrl()).thenThrow(IllegalStateException("browser is gone"))
+        `when`(sessionManager.checkHealthy(managedSession)).thenReturn(CheckState(-1))
+
+        val result = controller.callTool(MCPToolCallRequest(tool = "list_sessions"), response)
+
+        assertEquals(HttpStatus.OK, result.statusCode)
+        val text = result.body!!.content[0].text
+        // The listing must still answer. An unknown URL is an empty value — the
+        // mapper drops it, and the CLI renders that as `-`, which is the
+        // documented "unknown" marker.
+        assertTrue(text.contains(sessionId), text)
+        assertFalse(text.contains("\"url\""), text)
     }
 }

@@ -100,7 +100,41 @@ impl OptionDef {
     pub fn key(&self) -> &'static str {
         self.name.split(' ').next().unwrap_or(self.name)
     }
+
+    /// Whether this option's value may itself start with `-`
+    /// (`allow_hyphen_values`).
+    ///
+    /// Parsing normally reads a hyphen-leading token as the next flag, which is
+    /// right for almost every option — but `-a/--args` carries a raw
+    /// LoadOptions string (`-nMaxRetry 5 -lazyFlush`) that always starts with
+    /// `-`, so the space-separated form could never bind and the value was
+    /// mistaken for a positional seed URL.
+    #[allow(dead_code)] // consulted through HYPHEN_VALUE_OPTION_KEYS by args.rs
+    pub fn allows_hyphen_values(&self) -> bool {
+        HYPHEN_VALUE_OPTION_KEYS.contains(&self.key())
+    }
 }
+
+/// Option keys whose value may start with `-`; see
+/// [`OptionDef::allows_hyphen_values`]. `args::parse_raw_args` consumes the
+/// next token for these options even when it looks like a flag.
+pub const HYPHEN_VALUE_OPTION_KEYS: &[&str] = &["args"];
+
+/// Shared `--fail-on-false` definition for the assertion commands.
+///
+/// The exit-code contract these commands were missing: by default `is visible`
+/// prints `true`/`false` and exits 0 either way, so a false assertion is
+/// scriptable only through the printed value. With `--fail-on-false` the
+/// command exits 1 when the result is false or null, which is what a script
+/// gate wants. It is a CLI-side switch: it must be read from the parsed
+/// arguments, never sent as a tool argument (the backend validates the
+/// assertion tools' arguments strictly and only `selector` is allowed).
+const ASSERTION_EXIT_CODE_OPTION: OptionDef = OptionDef {
+    name: "fail-on-false",
+    description: "Exit 1 when the assertion is false or null (opt-in). Without it the command prints true/false and exits 0 either way.",
+    is_bool: true,
+    short: None,
+};
 
 /// A single CLI command definition.
 #[derive(Debug, Clone)]
@@ -302,6 +336,230 @@ pub fn load_strategy_js(load: &str) -> Result<String, String> {
             "invalid --load value: '{other}'. Expected one of: networkidle, domcontentloaded, load"
         )),
     }
+}
+
+/// Convert a `crawl --timeout` budget into milliseconds.
+///
+/// A plain integer means seconds (the same reading the LoadOptions use) and the
+/// `ms`/`s`/`m`/`h`/`d` suffixes are honoured; `None` when the value is not a
+/// duration at all, so a caller can refuse it instead of silently falling back
+/// to the server default.
+///
+/// This is the canonical implementation of the `--timeout` reading.  `main.rs`
+/// keeps a private copy (`crawl_timeout_to_millis`, used by
+/// `build_crawl_server_params`/`validate_crawl_timeout`); it should delegate
+/// here so the flag is validated and translated by one implementation.
+#[allow(dead_code)] // used by the crawl `--timeout` tests; see the doc note above
+pub fn crawl_timeout_to_millis(value: &str) -> Option<i64> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let (number, factor) = if let Some(number) = value.strip_suffix("ms") {
+        (number, 1_i64)
+    } else if let Some(number) = value.strip_suffix('s') {
+        (number, 1_000)
+    } else if let Some(number) = value.strip_suffix('m') {
+        (number, 60_000)
+    } else if let Some(number) = value.strip_suffix('h') {
+        (number, 3_600_000)
+    } else if let Some(number) = value.strip_suffix('d') {
+        (number, 86_400_000)
+    } else {
+        (value, 1_000)
+    };
+    if number.is_empty() || !number.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    number.parse::<i64>().ok().map(|n| n * factor)
+}
+
+/// Key a `tool_params_fn` uses to report a CLI-side argument error instead of
+/// emitting a tool call the backend can only reject with an internal message.
+///
+/// A params builder cannot return `Result`, so the failure travels as this
+/// sentinel and the dispatch layer turns it into a usage error (exit 2) before
+/// anything is sent — the same contract as the existing `_invalid_domain`
+/// sentinel.  `set` uses it for an unknown mode, a malformed `--json` header
+/// payload, and missing coordinates/dimensions, all of which used to reach the
+/// backend as a meaningless CDP call.
+///
+/// `main.rs` must check it next to `_invalid_domain`:
+/// `if let Some(message) = tool_params.get(commands::CLI_ERROR_SENTINEL)
+/// .and_then(|v| v.as_str()) { return Err(CliError(ExitCode::Usage,
+/// message.to_string())); }`
+pub const CLI_ERROR_SENTINEL: &str = "_cli_error";
+
+/// Build a [`CLI_ERROR_SENTINEL`] payload carrying a user-facing message.
+///
+/// The payload deliberately carries no `method`, so even before the dispatch
+/// layer learns to translate it, the call cannot perform a partial or
+/// destructive CDP action.
+fn cli_error(message: impl Into<String>) -> Value {
+    let mut map = serde_json::Map::new();
+    map.insert(
+        CLI_ERROR_SENTINEL.to_string(),
+        Value::String(message.into()),
+    );
+    Value::Object(map)
+}
+
+/// The closest candidate to `input` (Levenshtein distance ≤ 2, or a candidate
+/// that starts with it), used for "did you mean" hints on typos.
+pub fn closest_match<'a>(input: &str, candidates: &[&'a str]) -> Option<&'a str> {
+    let input = input.trim().to_ascii_lowercase();
+    if input.is_empty() {
+        return None;
+    }
+    let mut best: Option<(usize, &'a str)> = None;
+    for candidate in candidates {
+        let distance = levenshtein_distance(&input, candidate);
+        let acceptable = distance <= 2 || input.starts_with(candidate) || candidate.starts_with(&input);
+        if acceptable && best.is_none_or(|(best_distance, _)| distance < best_distance) {
+            best = Some((distance, candidate));
+        }
+    }
+    best.map(|(_, candidate)| candidate)
+}
+
+/// Levenshtein edit distance between two strings.
+fn levenshtein_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut previous: Vec<usize> = (0..=b.len()).collect();
+    let mut current = vec![0usize; b.len() + 1];
+    for (i, a_char) in a.iter().enumerate() {
+        current[0] = i + 1;
+        for (j, b_char) in b.iter().enumerate() {
+            let cost = usize::from(a_char != b_char);
+            current[j + 1] = (previous[j + 1] + 1)
+                .min(current[j] + 1)
+                .min(previous[j] + cost);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[b.len()]
+}
+
+/// Read a required decimal option, naming the flag in the error.
+///
+/// `set <mode>` used `unwrap_or(default)` for these, so a missing flag silently
+/// applied a value nobody asked for (`set geo` pinned the position to 0,0 and
+/// `set device` shrank the viewport to 390x844).
+fn require_number(args: &HashMap<String, Value>, key: &str, mode: &str) -> Result<f64, String> {
+    let pair = match key {
+        "lat" => "lon",
+        "lon" => "lat",
+        _ => "",
+    };
+    let together = if pair.is_empty() {
+        String::new()
+    } else {
+        format!(" Give --{key} together with --{pair}.")
+    };
+    match get_opt_str(args, key) {
+        None => Err(format!(
+            "set {mode} requires --{key} <number> (missing --{key}).{together}"
+        )),
+        Some(raw) => raw.trim().parse::<f64>().map_err(|_| {
+            format!("--{key} must be a number, got '{raw}' (set {mode}).{together}")
+        }),
+    }
+}
+
+/// Read a required integer option, naming the flag in the error.
+fn require_integer(args: &HashMap<String, Value>, key: &str, mode: &str) -> Result<i64, String> {
+    let pair = match key {
+        "width" => "height",
+        "height" => "width",
+        _ => "",
+    };
+    let together = if pair.is_empty() {
+        String::new()
+    } else {
+        format!(" Give --{key} together with --{pair}.")
+    };
+    match get_opt_str(args, key) {
+        None => Err(format!(
+            "set {mode} requires --{key} <px> (missing --{key}).{together}"
+        )),
+        Some(raw) => raw.trim().parse::<i64>().map_err(|_| {
+            format!("--{key} must be a whole number of pixels, got '{raw}' (set {mode}).{together}")
+        }),
+    }
+}
+
+/// Options that belong to one `set <mode>`, excluding the ones every mode
+/// shares (`--json` selects the JSON output envelope, `state` is the offline
+/// switch, `mode` is the positional).
+fn set_mode_options(mode: &str) -> &'static [&'static str] {
+    match mode {
+        "geo" => &["lat", "lon", "accuracy"],
+        "headers" => &["json"],
+        "media" => &["color-scheme"],
+        "device" => &["width", "height", "dpr", "mobile"],
+        _ => &[],
+    }
+}
+
+/// Reject an option that belongs to a different `set` mode.
+fn set_mode_option_error(mode: &str, args: &HashMap<String, Value>) -> Option<String> {
+    let allowed = set_mode_options(mode);
+    for (key, value) in args {
+        if matches!(key.as_str(), "_" | "_.dd" | "mode" | "state" | "json") {
+            continue;
+        }
+        if !SET_OPTION_KEYS.contains(&key.as_str()) {
+            // Not a `set` option at all — the command-level unknown-option
+            // check owns that report, so this one stays silent.
+            continue;
+        }
+        // A boolean flag the user did not pass is absent from the map; a value
+        // option is present with its value.
+        if value.is_null() || allowed.contains(&key.as_str()) {
+            continue;
+        }
+        let listed: Vec<String> = allowed.iter().map(|name| format!("--{name}")).collect();
+        let for_mode = if listed.is_empty() {
+            format!("`set {mode}` takes no mode-specific options.")
+        } else {
+            format!("`set {mode}` accepts {}.", listed.join(", "))
+        };
+        return Some(format!(
+            "--{key} does not apply to `set {mode}`: it was ignored. {for_mode}"
+        ));
+    }
+    None
+}
+
+/// Every option the `set` command declares.  Kept next to the mode table so a
+/// new option cannot be added without deciding which mode owns it.
+const SET_OPTION_KEYS: &[&str] = &[
+    "lat",
+    "lon",
+    "accuracy",
+    "json",
+    "color-scheme",
+    "width",
+    "height",
+    "dpr",
+    "mobile",
+];
+
+/// CDP payload that grants the geolocation permission for one origin.
+///
+/// `set geo` issues `Emulation.setGeolocationOverride`, but Chrome gates
+/// `navigator.geolocation.getCurrentPosition()` on the geolocation
+/// *permission*: without this call the emulated position is invisible to page
+/// script and the promise never settles.  The origin is the current page's, so
+/// the dispatch layer (which can read the session's URL) issues it — a params
+/// builder has no session access.
+#[allow(dead_code)] // wired by the dispatch layer (main.rs), pinned by a unit test here
+pub fn geolocation_grant_params(origin: &str) -> Value {
+    json!({
+        "method": "Browser.grantPermissions",
+        "params": { "permissions": ["geolocation"], "origin": origin },
+    })
 }
 
 /// Marker that [NETWORK_IDLE_JS] installs on the page to hold the tracker
@@ -1665,7 +1923,7 @@ pub fn all_commands() -> Vec<CommandDef> {
                 OptionDef { name: "filename", description: "Save snapshot to file instead of returning it in the response — a bare name is written to the snapshot directory with a .yml extension", is_bool: false, short: None },
                 OptionDef { name: "boxes", description: "Include each element's bounding box as [box=x,y,width,height] (enabled by default)", is_bool: true, short: None },
                 OptionDef { name: "no-boxes", description: "Disable bounding boxes in snapshot output", is_bool: true, short: None },
-                OptionDef { name: "interactive", description: "Interactive-oriented rendering: merge inner text into element names so ref lines read as self-contained targets (not a strict interactive-only filter). Combine with --stdout to see refs inline.", is_bool: true, short: Some("i") },
+                OptionDef { name: "interactive", description: "Interactive-only rendering: keeps the interactive nodes (pointer/role) and merges their inner text into the names, so each ref line reads as a self-contained target; non-interactive nodes (li[draggable] wrappers, tooltip spans) are dropped. Combine with -v <n> (e.g. -i -v 0) to bound a long page, and with --stdout to see the refs inline.", is_bool: true, short: Some("i") },
                 OptionDef { name: "urls", description: "Include href URLs for link elements", is_bool: true, short: Some("u") },
                 OptionDef { name: "compact", description: "Remove empty structural elements (enabled by default)", is_bool: true, short: Some("c") },
                 OptionDef { name: "no-compact", description: "Disable compact mode; include all structural nodes", is_bool: true, short: None },
@@ -1731,6 +1989,7 @@ pub fn all_commands() -> Vec<CommandDef> {
                 OptionDef { name: "files-with-matches", short: Some("l"), is_bool: true, description: "Print only whether matches exist" },
                 OptionDef { name: "fixed-strings", short: Some("F"), is_bool: true, description: "Treat pattern as a literal string, not regex" },
                 OptionDef { name: "word-regexp", short: Some("w"), is_bool: true, description: "Match only whole words" },
+                OptionDef { name: "only-matching", short: Some("o"), is_bool: true, description: "Print only the matched parts of each line (grep -o), one match per line — the way to harvest a value such as [$][0-9.]+ from the surrounding markup" },
                 OptionDef { name: "extended-regexp", short: Some("E"), is_bool: true, description: "Extended regex (ERE) — already the default. Accepted for compatibility with grep -E." },
                 OptionDef { name: "selector", short: None, is_bool: false, description: "CSS selector to scope the search to" },
                 OptionDef { name: "page", short: None, is_bool: false, description: "Page number (1-based, default: 1)" },
@@ -1833,6 +2092,7 @@ pub fn all_commands() -> Vec<CommandDef> {
                 OptionDef { name: "await", description: "Wait for the evaluated expression's Promise to resolve before returning the result", is_bool: true, short: None },
                 OptionDef { name: "wait-selector", description: "Wait for a CSS selector to appear in the DOM before evaluating (use for async-rendered content like React/SPA pages)", is_bool: false, short: None },
                 OptionDef { name: "wait-timeout", description: "Max time in ms to wait for --wait-selector (default: 30000)", is_bool: false, short: None },
+                OptionDef { name: "world", description: "JavaScript world to evaluate in: main (default) = the page's own world, where page-defined globals like window.myApp resolve; isolated = the driver's runtime world (__browser4_runtime__), which page scripts cannot see or modify", is_bool: false, short: None },
             ],
             e2e_coverage: E2eCoverage::Tested,
             tool_name_fn: |_| "browser_evaluate".to_string(),
@@ -1850,6 +2110,10 @@ pub fn all_commands() -> Vec<CommandDef> {
                 if get_bool(args, "await").unwrap_or(false) { p["awaitPromise"] = json!(true); }
                 if let Some(sel) = get_opt_str(args, "wait-selector") { p["waitSelector"] = json!(sel); }
                 if let Some(t) = get_opt_str(args, "wait-timeout") { p["waitTimeout"] = json!(t); }
+                // Which JavaScript world the script sees.  Passed through verbatim:
+                // the backend validates the value (main|isolated) so a typo is
+                // refused instead of silently evaluating in the other world.
+                if let Some(w) = get_opt_str(args, "world") { p["world"] = json!(w); }
                 p
             },
         },
@@ -1965,19 +2229,24 @@ pub fn all_commands() -> Vec<CommandDef> {
         },
         CommandDef {
             name: "download",
-            description: "Configure the browser to allow downloads into a directory (CDP Browser.setDownloadBehavior). Downloads then land in the given folder instead of the browser default.",
+            description: "Configure the browser to allow downloads into a directory (CDP Browser.setDownloadBehavior). Downloads then land in the given folder instead of the browser default. Relative --dir values are resolved against the CLI's working directory, so `download` and `wait --download` always watch the same folder.",
             category: Category::Network,
             hidden: false,
             batch_supported: false,
             args: &[],
             options: &[
-                OptionDef { name: "dir", description: "Download directory (default: ./downloads)", is_bool: false, short: None },
+                OptionDef { name: "dir", description: "Download directory — a relative path (including the default: downloads) is resolved against the CLI's current directory and sent as an absolute path", is_bool: false, short: None },
                 OptionDef { name: "behavior", description: "Download behavior: allow (default) or deny", is_bool: false, short: None },
             ],
             e2e_coverage: E2eCoverage::Tested, // real download flow via download fixture
             tool_name_fn: |_| "execute_cdp_command".to_string(),
             tool_params_fn: |args| {
-                let dir = get_opt_str(args, "dir").unwrap_or("downloads");
+                // Resolve client-side: Chrome resolves `downloadPath` against the
+                // *browser* process's working directory, while `wait --download`
+                // resolves the same spelling against the CLI's — so a relative
+                // default made the two watch different folders, and the
+                // eventual file landed somewhere nobody was looking.
+                let dir = absolutize_local_dir(get_opt_str(args, "dir").unwrap_or("downloads"));
                 let behavior = get_opt_str(args, "behavior").unwrap_or("allow");
                 json!({
                     "method": "Browser.setDownloadBehavior",
@@ -1987,7 +2256,7 @@ pub fn all_commands() -> Vec<CommandDef> {
         },
         CommandDef {
             name: "network-requests",
-            description: "List network requests tracked for the current tab, with optional filters (URL substring, resource type, HTTP method, status). Network tracking is enabled on first use; requests are kept in a bounded in-memory buffer.",
+            description: "List network requests tracked for the current tab, with optional filters (URL substring, resource type, HTTP method, status). Network tracking is enabled on first use; requests are kept in a bounded in-memory buffer. The default output is a compact table (method, status, type, URL); --json prints the raw envelope.",
             category: Category::Network,
             hidden: false,
             batch_supported: false,
@@ -1997,11 +2266,16 @@ pub fn all_commands() -> Vec<CommandDef> {
                 OptionDef { name: "type", description: "Comma-separated resource types, e.g. xhr,fetch", is_bool: false, short: None },
                 OptionDef { name: "method", description: "HTTP method, e.g. POST", is_bool: false, short: None },
                 OptionDef { name: "status", description: "Status filter: 200, 2xx, or a range like 400-499", is_bool: false, short: None },
+                OptionDef { name: "limit <n>", description: "Print only the newest <n> requests (default: the whole tracked buffer). Applied by the CLI's table renderer; the header reports the total and the buffer window.", is_bool: false, short: None },
                 OptionDef { name: "clear", description: "Drop all tracked requests first", is_bool: true, short: None },
             ],
             e2e_coverage: E2eCoverage::Tested,
             tool_name_fn: |_| "browser_network_requests".to_string(),
             tool_params_fn: |args| {
+                // Only the filters the backend declares are sent: its
+                // `networkRequests` arguments are validated strictly, so a
+                // CLI-side key such as `limit` must stay in the parsed map for
+                // the printer to read rather than travelling to the tool.
                 let mut p = json!({});
                 if let Some(f) = get_opt_str(args, "filter") { p["filter"] = json!(f); }
                 if let Some(t) = get_opt_str(args, "type") { p["type"] = json!(t); }
@@ -2074,6 +2348,18 @@ pub fn all_commands() -> Vec<CommandDef> {
                 if let Some(u) = get_opt_str(args, "urlPattern") { p["urlPattern"] = json!(u); }
                 p
             },
+        },
+        CommandDef {
+            name: "network-routes",
+            description: "List the request routes currently registered on the tab, in registration order (pattern, action, mock content type, resource types). Read-only: inspecting the active routes no longer means removing them first.",
+            category: Category::Network,
+            hidden: false,
+            batch_supported: false,
+            args: &[],
+            options: &[],
+            e2e_coverage: E2eCoverage::Tested,
+            tool_name_fn: |_| "browser_network_routes".to_string(),
+            tool_params_fn: |_| json!({}),
         },
         CommandDef {
             name: "har-start",
@@ -2196,7 +2482,7 @@ pub fn all_commands() -> Vec<CommandDef> {
             args: &[
                 ArgDef { name: "selector", description: "CSS selector or element reference (e.g. e5, #search)", optional: false },
             ],
-            options: &[],
+            options: &[ASSERTION_EXIT_CODE_OPTION],
             e2e_coverage: E2eCoverage::Tested,
             tool_name_fn: |_| "browser_is_visible".to_string(),
             tool_params_fn: |args| json!({ "selector": get_str(args, "selector").unwrap_or_default() }),
@@ -2210,7 +2496,7 @@ pub fn all_commands() -> Vec<CommandDef> {
             args: &[
                 ArgDef { name: "selector", description: "CSS selector or element reference (e.g. e5, #submit)", optional: false },
             ],
-            options: &[],
+            options: &[ASSERTION_EXIT_CODE_OPTION],
             e2e_coverage: E2eCoverage::Tested,
             tool_name_fn: |_| "browser_is_enabled".to_string(),
             tool_params_fn: |args| json!({ "selector": get_str(args, "selector").unwrap_or_default() }),
@@ -2224,7 +2510,7 @@ pub fn all_commands() -> Vec<CommandDef> {
             args: &[
                 ArgDef { name: "selector", description: "CSS selector or element reference (e.g. e5, #agree)", optional: false },
             ],
-            options: &[],
+            options: &[ASSERTION_EXIT_CODE_OPTION],
             e2e_coverage: E2eCoverage::Tested,
             tool_name_fn: |_| "browser_is_checked".to_string(),
             tool_params_fn: |args| json!({ "selector": get_str(args, "selector").unwrap_or_default() }),
@@ -2271,7 +2557,7 @@ pub fn all_commands() -> Vec<CommandDef> {
         },
         CommandDef {
             name: "highlight",
-            description: "Visually highlight the element matched by a selector with an outline overlay and scroll it into view",
+            description: "Visually highlight the element matched by a selector with an outline overlay and scroll it into view. The previous highlight is cleared first, so only one element carries the marker at a time.",
             category: Category::Core,
             hidden: false,
             batch_supported: false,
@@ -2283,8 +2569,24 @@ pub fn all_commands() -> Vec<CommandDef> {
             tool_name_fn: |_| "browser_evaluate".to_string(),
             tool_params_fn: |args| {
                 let selector = get_str(args, "selector").unwrap_or_default();
+                // The outline is an inline style on the page's own element, so it
+                // survives until it is taken back off. Each call therefore clears
+                // the previous marker (tagged with data-b4-highlight) before
+                // applying the new one: outlines used to accumulate on every
+                // element ever highlighted, and nothing could remove them.
                 json!({
-                    "expression": "element => { element.scrollIntoView({ behavior: 'smooth', block: 'center' }); element.style.outline = '3px solid #ff5722'; element.style.outlineOffset = '2px'; return 'highlighted'; }",
+                    "expression": r#"element => {
+                        for (const previous of document.querySelectorAll('[data-b4-highlight]')) {
+                            previous.style.outline = '';
+                            previous.style.outlineOffset = '';
+                            previous.removeAttribute('data-b4-highlight');
+                        }
+                        element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                        element.style.outline = '3px solid #ff5722';
+                        element.style.outlineOffset = '2px';
+                        element.setAttribute('data-b4-highlight', '1');
+                        return 'highlighted';
+                    }"#,
                     "ref": selector,
                 })
             },
@@ -2325,7 +2627,7 @@ pub fn all_commands() -> Vec<CommandDef> {
         },
         CommandDef {
             name: "set",
-            description: "Emulate browser capabilities via Chrome DevTools Protocol: `set geo`, `set offline`, `set headers`, `set media`, or `set device`",
+            description: "Emulate geo, offline, headers, media, or device (Chrome DevTools Protocol). Values apply to the current tab and stay in effect until changed or the session closes.",
             category: Category::DevTools,
             hidden: false,
             batch_supported: false,
@@ -2334,25 +2636,50 @@ pub fn all_commands() -> Vec<CommandDef> {
                 ArgDef { name: "state", description: "For offline: on or off (default: on)", optional: true },
             ],
             options: &[
-                OptionDef { name: "lat", description: "Latitude in degrees, -90 to 90 (geo; give --lat together with --lon)", is_bool: false, short: None },
-                OptionDef { name: "lon", description: "Longitude in degrees, -180 to 180 (geo; give --lon together with --lat)", is_bool: false, short: None },
+                OptionDef { name: "lat", description: "Latitude in degrees, -90 to 90 (geo, required; give --lat together with --lon)", is_bool: false, short: None },
+                OptionDef { name: "lon", description: "Longitude in degrees, -180 to 180 (geo, required; give --lon together with --lat)", is_bool: false, short: None },
                 OptionDef { name: "accuracy", description: "Position accuracy in meters (geo, default: 1)", is_bool: false, short: None },
-                OptionDef { name: "json", description: "Headers as a JSON object string, e.g. '{\"X-Api-Key\": \"abc\"}' (headers)", is_bool: false, short: None },
-                OptionDef { name: "color-scheme", description: "Emulated prefers-color-scheme: light, dark, or no-preference (media)", is_bool: false, short: None },
-                OptionDef { name: "width", description: "Viewport width in px (device; give --width together with --height)", is_bool: false, short: None },
-                OptionDef { name: "height", description: "Viewport height in px (device; give --height together with --width)", is_bool: false, short: None },
+                OptionDef { name: "json <headers>", description: "Headers as a JSON object string, e.g. '{\"X-Api-Key\": \"abc\"}' (headers, required). A malformed payload is refused instead of clearing the active headers.", is_bool: false, short: None },
+                OptionDef { name: "color-scheme", description: "Emulated prefers-color-scheme: light, dark, or no-preference (media; no-preference resets it)", is_bool: false, short: None },
+                OptionDef { name: "width", description: "Viewport width in px (device, required; give --width together with --height)", is_bool: false, short: None },
+                OptionDef { name: "height", description: "Viewport height in px (device, required; give --height together with --width)", is_bool: false, short: None },
                 OptionDef { name: "dpr", description: "Device scale factor (device, default: 1)", is_bool: false, short: None },
-                OptionDef { name: "mobile", description: "Enable mobile (touch) emulation (device)", is_bool: true, short: None },
+                OptionDef { name: "mobile", description: "Enable mobile (touch) emulation (device). Touch metrics only — the user agent is left unchanged.", is_bool: true, short: None },
             ],
             e2e_coverage: E2eCoverage::Tested,
             tool_name_fn: |_| "execute_cdp_command".to_string(),
             tool_params_fn: |args| {
                 let mode = get_str(args, "mode").unwrap_or_default().to_ascii_lowercase();
+                // Reject a mode-specific option that does not belong to this
+                // mode (e.g. `set geo --dpr 2`) instead of applying the mode and
+                // silently dropping half of what the user asked for.
+                if let Some(err) = set_mode_option_error(&mode, args) {
+                    return cli_error(err);
+                }
                 match mode.as_str() {
                     "geo" => {
-                        let lat = get_opt_str(args, "lat").and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
-                        let lon = get_opt_str(args, "lon").and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
-                        let accuracy = get_opt_str(args, "accuracy").and_then(|v| v.parse::<f64>().ok()).unwrap_or(1.0);
+                        let (lat, lon) = match (require_number(args, "lat", "geo"), require_number(args, "lon", "geo")) {
+                            (Ok(lat), Ok(lon)) => (lat, lon),
+                            (Err(err), _) | (_, Err(err)) => return cli_error(err),
+                        };
+                        let accuracy = match get_opt_str(args, "accuracy") {
+                            Some(raw) => match raw.trim().parse::<f64>() {
+                                Ok(value) => value,
+                                Err(_) => {
+                                    return cli_error(format!(
+                                        "--accuracy must be a number of meters, got '{raw}'."
+                                    ))
+                                }
+                            },
+                            None => 1.0,
+                        };
+                        // The override is only observable to the page once the
+                        // geolocation permission has been granted for its
+                        // origin; without it `getCurrentPosition()` never
+                        // settles. The origin lives with the session (see
+                        // `geolocation_grant_params`), so the dispatch layer
+                        // issues that call — the CLI cannot read the current URL
+                        // from a pure params builder.
                         json!({
                             "method": "Emulation.setGeolocationOverride",
                             "params": { "latitude": lat, "longitude": lon, "accuracy": accuracy },
@@ -2368,9 +2695,27 @@ pub fn all_commands() -> Vec<CommandDef> {
                     }
                     "headers" => {
                         let headers_json = get_opt_str(args, "json").unwrap_or("{}");
-                        let headers = serde_json::from_str::<Value>(headers_json)
-                            .map(|v| v)
-                            .unwrap_or_else(|_| json!({}));
+                        // A malformed payload must NOT be replaced by `{}`:
+                        // Network.setExtraHTTPHeaders replaces the whole header
+                        // set, so swallowing the parse error both reports
+                        // success and destroys the headers already configured.
+                        let headers = match serde_json::from_str::<Value>(headers_json) {
+                            Ok(Value::Object(map)) => Value::Object(map),
+                            Ok(_) => {
+                                return cli_error(format!(
+                                    "set headers --json must be a JSON object of header names to \
+                                     values, got '{headers_json}'. Example: --json \
+                                     '{{\"X-Api-Key\":\"abc\"}}'. Nothing was changed."
+                                ))
+                            }
+                            Err(err) => {
+                                return cli_error(format!(
+                                    "set headers --json is not valid JSON ({err}). Nothing was \
+                                     changed — pass an object such as \
+                                     '{{\"X-Api-Key\":\"abc\"}}'."
+                                ))
+                            }
+                        };
                         json!({
                             "method": "Network.setExtraHTTPHeaders",
                             "params": { "headers": headers },
@@ -2384,9 +2729,24 @@ pub fn all_commands() -> Vec<CommandDef> {
                         })
                     }
                     "device" => {
-                        let width = get_opt_str(args, "width").and_then(|v| v.parse::<i64>().ok()).unwrap_or(390);
-                        let height = get_opt_str(args, "height").and_then(|v| v.parse::<i64>().ok()).unwrap_or(844);
-                        let dpr = get_opt_str(args, "dpr").and_then(|v| v.parse::<f64>().ok()).unwrap_or(1.0);
+                        let (width, height) = match (
+                            require_integer(args, "width", "device"),
+                            require_integer(args, "height", "device"),
+                        ) {
+                            (Ok(width), Ok(height)) => (width, height),
+                            (Err(err), _) | (_, Err(err)) => return cli_error(err),
+                        };
+                        let dpr = match get_opt_str(args, "dpr") {
+                            Some(raw) => match raw.trim().parse::<f64>() {
+                                Ok(value) => value,
+                                Err(_) => {
+                                    return cli_error(format!(
+                                        "--dpr must be a device scale factor such as 2, got '{raw}'."
+                                    ))
+                                }
+                            },
+                            None => 1.0,
+                        };
                         let mobile = get_bool(args, "mobile").unwrap_or(false);
                         json!({
                             "method": "Emulation.setDeviceMetricsOverride",
@@ -2394,8 +2754,14 @@ pub fn all_commands() -> Vec<CommandDef> {
                         })
                     }
                     other => {
-                        // Unknown mode — emit an unusable call so the CLI errors early.
-                        json!({ "method": "", "params": { "mode": other } })
+                        let suggestion = closest_match(other, &["geo", "offline", "headers", "media", "device"])
+                            .map(|name| format!(" Did you mean '{name}'?"))
+                            .unwrap_or_default();
+                        cli_error(format!(
+                            "Unknown set mode '{other}'. Valid modes: geo, offline, headers, media, \
+                             device.{suggestion} Run `browser4-cli --help set` for each mode's \
+                             options."
+                        ))
                     }
                 }
             },
@@ -3009,11 +3375,11 @@ pub fn all_commands() -> Vec<CommandDef> {
         },
         CommandDef {
             name: "window-new",
-            description: "Create a new browser window (equivalent to opening a new tab)",
+            description: "Create an additional tab (a new browser target) and make it the active one, then navigate it to <url>. Managed and headless sessions model every target as a tab, so this is what `tab-new` does plus the selection; `tab-list`/`tab-select` switch between tabs, and popups opened by the page (window.open / target=_blank) appear in the same tab list.",
             category: Category::Tabs,
             hidden: false,
             batch_supported: true,
-            args: &[ArgDef { name: "url", description: "The URL to navigate to in the new window", optional: true }],
+            args: &[ArgDef { name: "url", description: "The URL to navigate to in the new tab (default: about:blank)", optional: true }],
             options: &[],
             e2e_coverage: E2eCoverage::Tested,
             tool_name_fn: |_| "browser_tabs".to_string(),
@@ -3740,7 +4106,7 @@ pub fn all_commands() -> Vec<CommandDef> {
             options: &[
                 OptionDef { name: "sql <query>", description: "X-SQL query to execute. Use @url as placeholder for the target URL. Prefix with @ to read from file (e.g. --sql @query.sql)", is_bool: false, short: None },
                 OptionDef { name: "sql-stdin", description: "Read X-SQL query from stdin (avoids shell quoting issues on Windows)", is_bool: true, short: None },
-                OptionDef { name: "sql-base64 <base64>", description: "Base64-encoded X-SQL query (avoid shell quoting issues on Windows)", is_bool: false, short: None },
+                OptionDef { name: "sql-base64 <base64>", description: "Base64-encoded X-SQL query (avoids shell quoting issues on Windows). Both shapes work: `--sql-base64 <base64>` supplies the query itself, and a bare `--sql-base64` (a flag, no value) decodes the --sql/stdin value.", is_bool: false, short: None },
                 OptionDef { name: "seed-file <file>", description: "File containing URLs to submit, one per line (direct path, no @ prefix). When provided, the URL positional arg can be omitted", is_bool: false, short: None },
                 OptionDef { name: "deadline <iso>", description: "Deadline for task completion (ISO 8601, e.g. 2026-02-24T23:59:59Z)", is_bool: false, short: None },
                 OptionDef { name: "expires <dur>", description: "Cache expiration duration (e.g. 1d, 1h)", is_bool: false, short: None },
@@ -3853,13 +4219,13 @@ pub fn all_commands() -> Vec<CommandDef> {
                 OptionDef { name: "seed-file <file>", description: "File containing URLs to crawl, one per line — each line must be an absolute http(s) URL (lines starting with # are ignored)", is_bool: false, short: None },
                 OptionDef { name: "sql <query>", description: "X-SQL query to extract structured data from each crawled page. Use @url as the page URL placeholder. Prefix with @ to read from file (e.g. --sql @query.sql)", is_bool: false, short: None },
                 OptionDef { name: "sql-stdin", description: "Read X-SQL query from stdin (avoids shell quoting issues on Windows)", is_bool: true, short: None },
-                OptionDef { name: "sql-base64 <base64>", description: "Base64-encoded X-SQL query (avoid shell quoting issues on Windows)", is_bool: false, short: None },
+                OptionDef { name: "sql-base64 <base64>", description: "Base64-encoded X-SQL query (avoids shell quoting issues on Windows). Both shapes work: `--sql-base64 <base64>` supplies the query itself, and a bare `--sql-base64` (a flag, no value) decodes the --sql/stdin value.", is_bool: false, short: None },
                 OptionDef { name: "format <fmt>", description: "Output format for X-SQL extracted data (requires --sql): json, csv, or table (default: table). Has no effect without --sql.", is_bool: false, short: None },
                 OptionDef { name: "output <file>", description: "Write results to a file instead of stdout", is_bool: false, short: Some("o") },
                 OptionDef { name: "out-link-selector <css>", description: "CSS selector to extract links from each page", is_bool: false, short: Some("ol") },
-                OptionDef { name: "out-link-pattern <regex>", description: "Regex pattern to filter extracted links (default: .+)", is_bool: false, short: Some("olp") },
+                OptionDef { name: "out-link-pattern <regex>", description: "Regex pattern to filter extracted links (default: .+). Git Bash/MSYS: a value starting with '/' is rewritten into a Windows path before the CLI starts — run `./b4w.sh` (or export MSYS2_ARG_CONV_EXCL='*'), or drop the leading slash (write -olp \"product/\")", is_bool: false, short: Some("olp") },
                 OptionDef { name: "top-links <n>", description: "Maximum links to extract per page (default: 20)", is_bool: false, short: Some("tl") },
-                OptionDef { name: "args <json>", description: "Additional LoadOptions passthrough. Prefix with @ to read from file (e.g. -a @loadopts.txt). Use --args-stdin to pipe from stdin.", is_bool: false, short: Some("a") },
+                OptionDef { name: "args <opts>", description: "Additional LoadOptions passed through verbatim — a raw whitespace-separated option string, not JSON (e.g. -a \"-nMaxRetry 5 -lazyFlush\"). Quote it so it stays one value; a leading '-' is accepted for this option. Prefix with @ to read from a file (e.g. -a @loadopts.txt). Use --args-stdin to pipe from stdin.", is_bool: false, short: Some("a") },
                 OptionDef { name: "args-stdin", description: "Read LoadOptions args from stdin (avoids shell quoting issues on Windows)", is_bool: true, short: None },
                 OptionDef { name: "refresh", description: "Force a fresh fetch, ignoring cache", is_bool: true, short: None },
                 OptionDef { name: "parse", description: "Parse each page immediately after fetching", is_bool: true, short: None },
@@ -3981,6 +4347,25 @@ pub fn all_commands() -> Vec<CommandDef> {
                     p["parallel"] = json!(v);
                 }
 
+                // Task budget: how long the whole crawl may run.  Sent as the
+                // duration the user typed (`30m`, `900`); main.rs validates it
+                // (validate_crawl_timeout) and translates it into the backend's
+                // `taskTimeoutMillis` (build_crawl_server_params).  Keeping the
+                // raw string here is what makes `--timeout` reach either of
+                // them: without it the flag was declared, documented, and
+                // silently dropped, so every crawl ran on the server default.
+                if let Some(v) = get_opt_str(args, "timeout") {
+                    p["timeout"] = json!(v);
+                }
+
+                // Per-page processing status is printed by the completion
+                // report in main.rs, which reads this CLI-side flag back out of
+                // the params.  Like `out-link-selector`/`out-link-pattern` it is
+                // carried in the map it was read from.
+                if let Some(true) = get_bool(args, "verbose") {
+                    p["verbose"] = json!(true);
+                }
+
                 p
             },
         },
@@ -3993,12 +4378,15 @@ pub fn all_commands() -> Vec<CommandDef> {
             args: &[
                 ArgDef { name: "id", description: "Task ID", optional: false },
             ],
-            options: &[],
+            options: &[
+                OptionDef { name: "json", description: "Emit a JSON envelope with the task record under \"record\" instead of the human summary (the record alone already goes to stdout; the summary moves to stderr when this flag is set)", is_bool: true, short: None },
+            ],
             e2e_coverage: E2eCoverage::Tested,
             tool_name_fn: |_| String::new(),
             tool_params_fn: |args| {
                 let mut p = json!({});
                 if let Some(v) = get_opt_str(args, "id") { p["id"] = json!(v); }
+                if let Some(true) = get_bool(args, "json") { p["json"] = json!(true); }
                 p
             },
         },
@@ -4013,6 +4401,7 @@ pub fn all_commands() -> Vec<CommandDef> {
             ],
             options: &[
                 OptionDef { name: "verbose", description: "Also print each page with its provenance (fetched by this run vs restored from a checkpoint)", is_bool: true, short: None },
+                OptionDef { name: "json", description: "Emit a JSON envelope with the task record under \"record\" instead of the human summary (the record alone already goes to stdout; the summary moves to stderr when this flag is set)", is_bool: true, short: None },
             ],
             e2e_coverage: E2eCoverage::Tested,
             tool_name_fn: |_| String::new(),
@@ -4020,6 +4409,7 @@ pub fn all_commands() -> Vec<CommandDef> {
                 let mut p = json!({});
                 if let Some(v) = get_opt_str(args, "id") { p["id"] = json!(v); }
                 if let Some(true) = get_bool(args, "verbose") { p["verbose"] = json!(true); }
+                if let Some(true) = get_bool(args, "json") { p["json"] = json!(true); }
                 p
             },
         },
@@ -4053,7 +4443,15 @@ pub fn all_commands() -> Vec<CommandDef> {
             ],
             e2e_coverage: E2eCoverage::Tested,
             tool_name_fn: |_| String::new(),
-            tool_params_fn: |_| json!({}),
+            tool_params_fn: |args| {
+                // `handle_crawl_clear` reads this back out of the params, so an
+                // unwired flag would make `crawl clear --all` a plain clear.
+                let mut p = json!({});
+                if let Some(true) = get_bool(args, "all") {
+                    p["all"] = json!(true);
+                }
+                p
+            },
         },
         CommandDef {
             name: "crawl-list",
@@ -4374,6 +4772,7 @@ pub fn all_commands() -> Vec<CommandDef> {
                 OptionDef { name: "files-with-matches", short: Some("l"), is_bool: true, description: "Print only whether matches exist" },
                 OptionDef { name: "fixed-strings", short: Some("F"), is_bool: true, description: "Treat pattern as a literal string, not regex" },
                 OptionDef { name: "word-regexp", short: Some("w"), is_bool: true, description: "Match only whole words" },
+                OptionDef { name: "only-matching", short: Some("o"), is_bool: true, description: "Print only the matched parts of each line (grep -o), one match per line — the way to harvest a value such as [$][0-9.]+ from the surrounding markup" },
                 OptionDef { name: "extended-regexp", short: Some("E"), is_bool: true, description: "Extended regex (ERE) — already the default. Accepted for compatibility with grep -E." },
                 OptionDef { name: "selector <css>", short: None, is_bool: false, description: "CSS selector to scope the search to (querySelector semantics: first match only). Use --selector-all to search across all matching elements." },
                 OptionDef { name: "selector-all <css>", short: None, is_bool: false, description: "CSS selector to scope the search to all matching elements (querySelectorAll semantics). Each element's inner HTML is searched independently, and results are annotated with the element index." },
@@ -5879,6 +6278,178 @@ mod tests {
         assert_eq!(params["params"]["width"], 390);
         assert_eq!(params["params"]["deviceScaleFactor"], 3.0);
         assert_eq!(params["params"]["mobile"], true);
+    }
+
+    /// A set-mode error must travel as the CLI sentinel, never as a CDP call:
+    /// the sentinel payload carries no `method`, so nothing can be applied
+    /// while the dispatch layer turns it into a usage error.
+    fn set_error(params: &Value) -> &str {
+        assert!(
+            params.get("method").is_none(),
+            "an invalid `set` invocation must not build a CDP call: {params}"
+        );
+        params
+            .get(CLI_ERROR_SENTINEL)
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| panic!("expected a {CLI_ERROR_SENTINEL} payload, got {params}"))
+    }
+
+    #[test]
+    fn test_set_unknown_mode_lists_the_valid_modes() {
+        let map = commands_map();
+        let cmd = map.get("set").unwrap();
+        let mut args = HashMap::new();
+        args.insert("mode".to_string(), json!("bogus"));
+        let params = (cmd.tool_params_fn)(&args);
+        let message = set_error(&params);
+        assert!(
+            message.starts_with("Unknown set mode 'bogus'. Valid modes: geo, offline, headers, media, device."),
+            "unexpected message: {message}"
+        );
+        assert!(message.contains("--help set"), "message needs a help pointer: {message}");
+        // The old payload leaked a protocol error ("Message must have string
+        // 'method' property") that never named the modes.
+        assert!(!message.contains("method"));
+    }
+
+    #[test]
+    fn test_set_unknown_mode_suggests_the_closest_mode() {
+        let map = commands_map();
+        let cmd = map.get("set").unwrap();
+        let mut args = HashMap::new();
+        args.insert("mode".to_string(), json!("geoo"));
+        let message = set_error(&(cmd.tool_params_fn)(&args)).to_string();
+        assert!(message.contains("Did you mean 'geo'?"), "got: {message}");
+    }
+
+    #[test]
+    fn test_set_headers_rejects_malformed_json_instead_of_clearing_headers() {
+        let map = commands_map();
+        let cmd = map.get("set").unwrap();
+        let mut args = HashMap::new();
+        args.insert("mode".to_string(), json!("headers"));
+        args.insert("json".to_string(), json!("not-json-at-all"));
+        let params = (cmd.tool_params_fn)(&args);
+        let message = set_error(&params);
+        assert!(message.contains("not valid JSON"), "got: {message}");
+        assert!(message.contains("Nothing was changed"), "got: {message}");
+        // The destructive reading was `Network.setExtraHTTPHeaders` with `{}` —
+        // a full replacement that wiped every configured header.
+        assert!(params.get("params").is_none());
+    }
+
+    #[test]
+    fn test_set_headers_rejects_a_non_object_payload() {
+        let map = commands_map();
+        let cmd = map.get("set").unwrap();
+        let mut args = HashMap::new();
+        args.insert("mode".to_string(), json!("headers"));
+        args.insert("json".to_string(), json!("[\"X-Api-Key\"]"));
+        let message = set_error(&(cmd.tool_params_fn)(&args)).to_string();
+        assert!(message.contains("must be a JSON object"), "got: {message}");
+    }
+
+    #[test]
+    fn test_set_headers_accepts_an_empty_object_to_clear_headers() {
+        // Clearing headers stays possible — it just has to be asked for.
+        let map = commands_map();
+        let cmd = map.get("set").unwrap();
+        let mut args = HashMap::new();
+        args.insert("mode".to_string(), json!("headers"));
+        args.insert("json".to_string(), json!("{}"));
+        let params = (cmd.tool_params_fn)(&args);
+        assert_eq!(params["method"], "Network.setExtraHTTPHeaders");
+        assert_eq!(params["params"]["headers"], json!({}));
+    }
+
+    #[test]
+    fn test_set_geo_requires_both_coordinates() {
+        let map = commands_map();
+        let cmd = map.get("set").unwrap();
+
+        let mut missing_lat = HashMap::new();
+        missing_lat.insert("mode".to_string(), json!("geo"));
+        missing_lat.insert("lon".to_string(), json!("2.2945"));
+        let message = set_error(&(cmd.tool_params_fn)(&missing_lat)).to_string();
+        assert!(message.contains("missing --lat"), "got: {message}");
+        assert!(message.contains("--lon"), "the pairing must be spelled out: {message}");
+
+        let mut missing_lon = HashMap::new();
+        missing_lon.insert("mode".to_string(), json!("geo"));
+        missing_lon.insert("lat".to_string(), json!("48.8584"));
+        let message = set_error(&(cmd.tool_params_fn)(&missing_lon)).to_string();
+        assert!(message.contains("missing --lon"), "got: {message}");
+
+        let mut nonsense = HashMap::new();
+        nonsense.insert("mode".to_string(), json!("geo"));
+        nonsense.insert("lat".to_string(), json!("north"));
+        nonsense.insert("lon".to_string(), json!("2.2945"));
+        let message = set_error(&(cmd.tool_params_fn)(&nonsense)).to_string();
+        assert!(message.contains("--lat must be a number"), "got: {message}");
+    }
+
+    #[test]
+    fn test_set_device_requires_both_dimensions() {
+        let map = commands_map();
+        let cmd = map.get("set").unwrap();
+
+        let mut missing_width = HashMap::new();
+        missing_width.insert("mode".to_string(), json!("device"));
+        missing_width.insert("height".to_string(), json!("844"));
+        let message = set_error(&(cmd.tool_params_fn)(&missing_width)).to_string();
+        assert!(message.contains("missing --width"), "got: {message}");
+
+        let mut missing_height = HashMap::new();
+        missing_height.insert("mode".to_string(), json!("device"));
+        missing_height.insert("width".to_string(), json!("390"));
+        let message = set_error(&(cmd.tool_params_fn)(&missing_height)).to_string();
+        assert!(message.contains("missing --height"), "got: {message}");
+    }
+
+    #[test]
+    fn test_set_rejects_an_option_from_another_mode() {
+        let map = commands_map();
+        let cmd = map.get("set").unwrap();
+        let mut args = HashMap::new();
+        args.insert("mode".to_string(), json!("geo"));
+        args.insert("lat".to_string(), json!("48.8584"));
+        args.insert("lon".to_string(), json!("2.2945"));
+        args.insert("dpr".to_string(), json!("2"));
+        let message = set_error(&(cmd.tool_params_fn)(&args)).to_string();
+        assert!(message.contains("--dpr does not apply to `set geo`"), "got: {message}");
+        assert!(message.contains("--lat, --lon, --accuracy"), "got: {message}");
+    }
+
+    #[test]
+    fn test_set_accepts_the_global_json_output_flag_in_every_mode() {
+        let map = commands_map();
+        let cmd = map.get("set").unwrap();
+        let mut args = HashMap::new();
+        args.insert("mode".to_string(), json!("media"));
+        args.insert("color-scheme".to_string(), json!("dark"));
+        args.insert("json".to_string(), json!(true));
+        let params = (cmd.tool_params_fn)(&args);
+        assert_eq!(params["method"], "Emulation.setEmulatedMedia");
+    }
+
+    #[test]
+    fn test_geolocation_grant_payload_shape() {
+        // Chrome gates getCurrentPosition on the geolocation permission, so the
+        // override alone is invisible to page script.
+        let grant = geolocation_grant_params("http://localhost:18080");
+        assert_eq!(grant["method"], "Browser.grantPermissions");
+        assert_eq!(grant["params"]["permissions"], json!(["geolocation"]));
+        assert_eq!(grant["params"]["origin"], "http://localhost:18080");
+    }
+
+    #[test]
+    fn test_closest_match_suggests_typo_corrections() {
+        let modes = ["geo", "offline", "headers", "media", "device"];
+        assert_eq!(closest_match("geoo", &modes), Some("geo"));
+        assert_eq!(closest_match("offlin", &modes), Some("offline"));
+        assert_eq!(closest_match("medi", &modes), Some("media"));
+        assert_eq!(closest_match("completely-different", &modes), None);
+        assert_eq!(closest_match("", &modes), None);
     }
 
     #[test]
@@ -8643,6 +9214,155 @@ mod tests {
         assert!(params.get("parallel").is_none());
     }
 
+    /// `--timeout` was declared (and documented) but never copied into the
+    /// params map, so `main.rs`'s `validate_crawl_timeout` and
+    /// `build_crawl_server_params` both saw an absent value: the flag was
+    /// accepted, validated against nothing, and every crawl ran on the
+    /// server's 10-minute default.
+    ///
+    /// The test drives the *real* `tool_params_fn`: the previous coverage built
+    /// the params map by hand, which is exactly the mistake that hid the gap.
+    #[test]
+    fn test_crawl_params_carry_the_declared_timeout_budget() {
+        let map = commands_map();
+        let cmd = map.get("crawl").unwrap();
+        let timeout = cmd
+            .options
+            .iter()
+            .find(|o| o.key() == "timeout")
+            .expect("crawl must expose a --timeout option");
+        assert!(!timeout.is_bool, "--timeout takes a duration, not a flag");
+
+        let mut args = HashMap::new();
+        args.insert("url".to_string(), json!("https://example.com"));
+        args.insert("timeout".to_string(), json!("30m"));
+        let params = (cmd.tool_params_fn)(&args);
+
+        // The raw duration travels to main.rs, which converts it into the
+        // backend's `taskTimeoutMillis`.
+        assert_eq!(params["timeout"].as_str().unwrap(), "30m");
+        assert_eq!(
+            crawl_timeout_to_millis(params["timeout"].as_str().unwrap()),
+            Some(1_800_000),
+            "30m must become a 1 800 000 ms task budget"
+        );
+    }
+
+    #[test]
+    fn test_crawl_params_timeout_absent_by_default() {
+        let map = commands_map();
+        let cmd = map.get("crawl").unwrap();
+        let mut args = HashMap::new();
+        args.insert("url".to_string(), json!("https://example.com"));
+        let params = (cmd.tool_params_fn)(&args);
+        // Absent = server default (10m). Sending a budget the user never asked
+        // for would silently extend or shorten the crawl.
+        assert!(params.get("timeout").is_none());
+    }
+
+    #[test]
+    fn test_crawl_timeout_duration_readings() {
+        // The documented readings: seconds as a bare number, and the
+        // ms/s/m/h/d suffixes.
+        assert_eq!(crawl_timeout_to_millis("900"), Some(900_000));
+        assert_eq!(crawl_timeout_to_millis("30s"), Some(30_000));
+        assert_eq!(crawl_timeout_to_millis("10m"), Some(600_000));
+        assert_eq!(crawl_timeout_to_millis("1h"), Some(3_600_000));
+        assert_eq!(crawl_timeout_to_millis("500ms"), Some(500));
+        // Values main.rs must refuse: not a duration at all.
+        assert_eq!(crawl_timeout_to_millis("soon"), None);
+        assert_eq!(crawl_timeout_to_millis("2h"), Some(7_200_000)); // above the 1h cap — main.rs refuses it
+        assert_eq!(crawl_timeout_to_millis(""), None);
+    }
+
+    /// `crawl --verbose` is read back out of the params by the completion
+    /// report (`handle_crawl_submit`), so the option is dead unless the params
+    /// builder carries it — the same defect class as `--timeout`.
+    #[test]
+    fn test_crawl_params_carry_verbose_for_the_completion_report() {
+        let map = commands_map();
+        let cmd = map.get("crawl").unwrap();
+        let mut args = HashMap::new();
+        args.insert("url".to_string(), json!("https://example.com"));
+        args.insert("verbose".to_string(), json!(true));
+        let params = (cmd.tool_params_fn)(&args);
+        assert_eq!(params["verbose"], json!(true));
+
+        let mut quiet = HashMap::new();
+        quiet.insert("url".to_string(), json!("https://example.com"));
+        assert!((cmd.tool_params_fn)(&quiet).get("verbose").is_none());
+    }
+
+    /// Every option a crawl/swarm command declares must be read by its
+    /// `tool_params_fn`/`tool_name_fn` (or forwarded wholesale by a generic
+    /// `for (k, v) in args` passthrough). `--timeout` and `crawl --verbose` were
+    /// declared, documented, and silently dropped; this guard catches the next
+    /// one at review time instead of at a user's expense.
+    #[test]
+    fn test_crawl_and_swarm_options_are_all_wired() {
+        let source = include_str!("commands.rs");
+        let mut checked = 0;
+        for block in command_def_blocks(source) {
+            let Some(name) = block_name(&block) else { continue };
+            if !name.starts_with("crawl") && !name.starts_with("swarm") {
+                continue;
+            }
+            let declared = declared_option_keys(&block);
+            if declared.is_empty() {
+                continue;
+            }
+            checked += 1;
+            // A generic passthrough forwards every parsed key verbatim.
+            if block.contains("for (k, v) in args") {
+                continue;
+            }
+            let body = block
+                .find("e2e_coverage")
+                .map(|idx| &block[idx..])
+                .unwrap_or(&block[..]);
+            for key in declared {
+                assert!(
+                    body.contains(&format!("\"{key}\"")),
+                    "'{name}' declares --{key} but its params builder never reads it"
+                );
+            }
+        }
+        assert!(
+            checked >= 8,
+            "the crawl/swarm audit matched only {checked} command definitions — \
+             the block parser stopped working"
+        );
+    }
+
+    /// Split the registry source into `CommandDef { … }` blocks.
+    fn command_def_blocks(source: &str) -> Vec<String> {
+        let mut blocks = Vec::new();
+        for part in source.split("\n        CommandDef {").skip(1) {
+            blocks.push(part.to_string());
+        }
+        blocks
+    }
+
+    /// The `name: "…"` of a registry block.
+    fn block_name(block: &str) -> Option<&str> {
+        let rest = block.split_once("name: \"")?.1;
+        rest.split_once('"').map(|(name, _)| name)
+    }
+
+    /// The machine keys of every `OptionDef` declared in a registry block.
+    fn declared_option_keys(block: &str) -> Vec<String> {
+        let mut keys = Vec::new();
+        let mut rest = block;
+        while let Some((_, after)) = rest.split_once("OptionDef { name: \"") {
+            let Some((name, tail)) = after.split_once('"') else { break };
+            if let Some(key) = name.split(' ').next() {
+                keys.push(key.to_string());
+            }
+            rest = tail;
+        }
+        keys
+    }
+
     #[test]
     fn test_crawl_params_expires_and_priority() {
         let map = commands_map();
@@ -8796,6 +9516,22 @@ mod tests {
         assert_eq!(cmd.category, Category::Swarm);
     }
 
+    /// `crawl clear --all` is read back out of the params by
+    /// `handle_crawl_clear`; an empty builder made the flag a no-op whose
+    /// "clear everything" promise silently degraded to "clear terminal tasks".
+    #[test]
+    fn test_crawl_clear_params_carry_the_all_flag() {
+        let map = commands_map();
+        let cmd = map.get("crawl-clear").unwrap();
+        let mut args = HashMap::new();
+        args.insert("all".to_string(), json!(true));
+        assert_eq!((cmd.tool_params_fn)(&args)["all"], json!(true));
+
+        let mut plain = HashMap::new();
+        plain.insert("all".to_string(), json!(false));
+        assert!((cmd.tool_params_fn)(&plain).get("all").is_none());
+    }
+
     #[test]
     fn test_crawl_list_command_exists() {
         let map = commands_map();
@@ -8859,6 +9595,34 @@ mod tests {
         args.insert("id".to_string(), json!("task-123"));
         let params = (cmd.tool_params_fn)(&args);
         assert_eq!(params["id"].as_str().unwrap(), "task-123");
+    }
+
+    /// `crawl status` / `crawl result` print a human summary on stderr and the
+    /// raw record on stdout; `--json` is the envelope scripts asked for, and it
+    /// only exists if the params builder carries the flag.
+    #[test]
+    fn test_crawl_status_and_result_carry_the_json_envelope_flag() {
+        let map = commands_map();
+        for name in ["crawl-status", "crawl-result"] {
+            let cmd = map.get(name).unwrap();
+            assert!(
+                cmd.options.iter().any(|option| option.key() == "json"),
+                "{name} must declare a --json option"
+            );
+            let mut args = HashMap::new();
+            args.insert("id".to_string(), json!("task-123"));
+            args.insert("json".to_string(), json!(true));
+            let params = (cmd.tool_params_fn)(&args);
+            assert_eq!(params["json"], json!(true), "{name} must carry --json");
+            assert_eq!(params["id"], json!("task-123"));
+
+            let mut plain = HashMap::new();
+            plain.insert("id".to_string(), json!("task-123"));
+            assert!(
+                (cmd.tool_params_fn)(&plain).get("json").is_none(),
+                "{name} must not request the envelope unless asked"
+            );
+        }
     }
 
     #[test]

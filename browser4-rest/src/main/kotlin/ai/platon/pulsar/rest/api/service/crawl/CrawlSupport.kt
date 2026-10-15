@@ -958,6 +958,31 @@ private fun formatAge(totalSeconds: Long): String {
 }
 
 /**
+ * The terminal note that makes an HTTP error page visible.
+ *
+ * A 4xx/5xx response still carries a body, so the crawl parses it into a document
+ * and records a page — indistinguishable, before `httpStatus`, from a page the site
+ * actually serves.  The per-row status is what lets a consumer tell the two apart;
+ * this note is what stops the *summary* from calling such a crawl a plain success.
+ *
+ * Store-served rows are excluded on purpose: their status describes the copy the
+ * page store kept, not this crawl's fetch (see [CrawlPageResult.servedFromStore]).
+ */
+internal fun buildHttpErrorNote(pages: List<CrawlPageResult>): String? {
+    val errorPages = pages.filter { !it.servedFromStore && (it.httpStatus ?: 0) >= 400 }
+    if (errorPages.isEmpty()) return null
+    val byStatus = errorPages.groupingBy { it.httpStatus ?: 0 }.eachCount()
+        .entries.sortedByDescending { it.value }
+        .joinToString(", ") { "${it.key}: ${it.value}" }
+    val shown = errorPages.take(MAX_REPORTED_FAILED_PAGES).joinToString("; ") { "${it.url} (${it.httpStatus})" }
+    val more = if (errorPages.size > MAX_REPORTED_FAILED_PAGES) {
+        " (+${errorPages.size - MAX_REPORTED_FAILED_PAGES} more)"
+    } else ""
+    return "${errorPages.size} of ${pages.size} page(s) were served with an HTTP error status " +
+        "($byStatus): $shown$more"
+}
+
+/**
  * The terminal note that makes a loss visible.  A crawl that dropped pages
  * must say so — with the URLs and the reason — instead of reporting a page
  * count smaller than the number of pages it set out to fetch.

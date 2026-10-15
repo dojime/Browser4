@@ -1126,6 +1126,29 @@ async fn running_server_version(client: &Client, base_url: &str, port: u16) -> O
     probe_server_version(client, base_url).await
 }
 
+/// Notice for `BROWSER4_CLI_FORCE_REBUILD_BUNDLE=1` when a server is already
+/// running, or `None` when the flag is unset.
+///
+/// The forced rebuild lives on the server-start path only
+/// ([`try_build_local_runtime_bundle`] is reached from
+/// [`resolve_server_launch_spec`]), so a healthy managed server makes the flag a
+/// no-op.  Saying so beats the silent skip: a user who set the flag believes a
+/// rebuild happened, and then diagnoses a "stale" bundle that was never rebuilt
+/// (this cost a full diagnostic cycle during the plugin fix).
+///
+/// Deliberately a notice rather than an auto stop/rebuild/restart: silently
+/// killing a running server would throw away live browser sessions.
+fn force_rebuild_ignored_message(port: u16) -> Option<String> {
+    if !should_force_rebuild_bundle() {
+        return None;
+    }
+    Some(format!(
+        "\u{26A0}  ignoring {FORCE_REBUILD_BUNDLE_ENV}=1: a Browser4 server is already running on port {port}.\n\
+         \x20  The runtime bundle is only rebuilt when the CLI starts the server.\n\
+         \x20  To rebuild it now:  browser4-cli stop   (then re-run this command)"
+    ))
+}
+
 /// Decide what to do with an existing, ready server: check for plugin
 /// fingerprint changes, then (when enforcement is active) check that the
 /// running backend matches the version this CLI would launch and restart it
@@ -1136,6 +1159,12 @@ async fn on_existing_server_ready(
     port: u16,
     enforce_version: bool,
 ) -> Result<(), String> {
+    // Explain the no-op before any early return: a forced rebuild cannot happen
+    // while this server keeps the port.
+    if let Some(notice) = force_rebuild_ignored_message(port) {
+        eprintln!("{notice}");
+    }
+
     if plugins_changed_since_server_start(port) {
         return restart_server_for_plugin_change(base_url, port).await;
     }
@@ -7823,6 +7852,9 @@ async fn try_build_local_runtime_bundle(
             "Local Browser4 runtime bundle built successfully at {}.",
             paths.runtime_bundle_dir.display()
         );
+        if let Some(warning) = local_bundle_plugin_warning(root, &paths.work_dir) {
+            eprintln!("{warning}");
+        }
         return Ok(Some(runtime));
     }
 
@@ -7846,6 +7878,67 @@ fn resolve_maven_program(root: &Path) -> PathBuf {
     } else {
         PathBuf::from("mvn")
     }
+}
+
+/// Describe a freshly built local runtime bundle that ships no (or a
+/// version-skewed) `browser4-swarm` plugin, or `None` when the bundled plugin
+/// matches the checkout.
+///
+/// The bundle build script resolves Maven's *real* local repository and now
+/// selects the plugin JAR by project version, but its own output is discarded on
+/// a successful build ([`run_bundle_build_script`] prints stdout/stderr only when
+/// the build fails).  Without this re-check a plugin-less bundle stayed silent
+/// until the first swarm command answered `503 Swarm backend is not installed`.
+fn local_bundle_plugin_warning(root: &Path, work_dir: &Path) -> Option<String> {
+    let plugins_dir = work_dir.join(BROWSER4_PLUGINS_DIR_NAME);
+    let mut swarm_versions: Vec<String> = Vec::new();
+    if let Ok(entries) = fs::read_dir(&plugins_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if let Some(rest) = name.strip_prefix("browser4-swarm-") {
+                if let Some(version) = rest.strip_suffix(".jar") {
+                    swarm_versions.push(version.to_string());
+                }
+            }
+        }
+    }
+    swarm_versions.sort();
+    swarm_versions.dedup();
+
+    let checked_out = checked_out_project_version(root);
+    let expected = checked_out.clone().unwrap_or_else(|| "(unknown)".to_string());
+    let matches_checkout = match checked_out.as_deref() {
+        Some(version) => swarm_versions
+            .iter()
+            .any(|bundled| bundled.eq_ignore_ascii_case(version)),
+        None => !swarm_versions.is_empty(),
+    };
+    if matches_checkout {
+        return None;
+    }
+
+    let rebuild = runtime_bundle_rebuild_command(root);
+    let reason = if swarm_versions.is_empty() {
+        format!(
+            "it ships no browser4-swarm plugin at all ({})",
+            plugins_dir.display()
+        )
+    } else {
+        format!(
+            "it ships browser4-swarm-{}.jar, a different release train than the checkout's {}",
+            swarm_versions.join(".jar, browser4-swarm-"),
+            expected
+        )
+    };
+
+    Some(format!(
+        "\n\u{26A0}  The runtime bundle will not serve swarm requests: {reason}.\n\
+         \x20  Every /api/swarm/** endpoint will answer 503 \"Swarm backend is not installed\".\n\
+         \x20  Install the plugin for the checked-out version ({expected}) and rebuild the bundle:\n\
+         \x20    mvn install -pl browser4-plugins/browser4-swarm -DskipTests\n\
+         \x20    {rebuild}\n\
+         \x20  The bundle build also records this in the bundle's runtime-bundle.json (pluginWarnings)."
+    ))
 }
 
 /// Run the bundle build script and wait for it to finish.
@@ -9950,6 +10043,83 @@ mod tests {
         // No metadata file — is_runtime_bundle_root should still detect the bundle.
         assert!(is_runtime_bundle_root(tmp.path()));
         assert_eq!(resolve_runtime_bundle_root(tmp.path()).unwrap(), tmp.path());
+    }
+
+    /// The bundle build prints its stdout only when it fails, so a bundle that
+    /// ships no browser4-swarm plugin used to stay silent until the first swarm
+    /// command answered 503.  The build path must report it itself.
+    #[test]
+    fn test_local_bundle_plugin_warning_reports_missing_plugin() {
+        let tmp = test_temp_dir();
+        let root = tmp.path().join("checkout");
+        let work_dir = tmp.path().join("work");
+        fs::create_dir_all(&root).unwrap();
+        write_root_pom_with_version(&root, "4.14.1-SNAPSHOT");
+        fs::create_dir_all(work_dir.join(BROWSER4_PLUGINS_DIR_NAME)).unwrap();
+
+        let warning = local_bundle_plugin_warning(&root, &work_dir)
+            .expect("a plugin-less bundle must be reported");
+        assert!(
+            warning.contains("no browser4-swarm plugin"),
+            "warning must name the condition: {warning}"
+        );
+        assert!(
+            warning.contains("503"),
+            "warning must name the user-visible symptom: {warning}"
+        );
+        assert!(
+            warning.contains("4.14.1-SNAPSHOT") && warning.contains("browser4-plugins/browser4-swarm"),
+            "warning must name the expected version and the install recipe: {warning}"
+        );
+    }
+
+    /// A plugin from another release train is the rc.8-into-rc.10 defect: it
+    /// loads, so nothing fails, but the backend is not running the checked-out
+    /// code.
+    #[test]
+    fn test_local_bundle_plugin_warning_reports_version_skew() {
+        let tmp = test_temp_dir();
+        let root = tmp.path().join("checkout");
+        let work_dir = tmp.path().join("work");
+        let plugins_dir = work_dir.join(BROWSER4_PLUGINS_DIR_NAME);
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&plugins_dir).unwrap();
+        write_root_pom_with_version(&root, "4.14.0-rc.10");
+        write(
+            plugins_dir.join("browser4-swarm-4.14.0-rc.8.jar"),
+            "jar",
+        )
+        .unwrap();
+
+        let warning = local_bundle_plugin_warning(&root, &work_dir)
+            .expect("a version-skewed plugin must be reported");
+        assert!(
+            warning.contains("browser4-swarm-4.14.0-rc.8.jar")
+                && warning.contains("4.14.0-rc.10"),
+            "warning must name both the bundled and the checked-out version: {warning}"
+        );
+    }
+
+    /// The matching plugin is the happy path and must stay silent — the warning
+    /// would otherwise be noise on every dev-mode start.
+    #[test]
+    fn test_local_bundle_plugin_warning_silent_for_matching_plugin() {
+        let tmp = test_temp_dir();
+        let root = tmp.path().join("checkout");
+        let work_dir = tmp.path().join("work");
+        let plugins_dir = work_dir.join(BROWSER4_PLUGINS_DIR_NAME);
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&plugins_dir).unwrap();
+        write_root_pom_with_version(&root, "4.14.1-SNAPSHOT");
+        write(
+            plugins_dir.join("browser4-swarm-4.14.1-SNAPSHOT.jar"),
+            "jar",
+        )
+        .unwrap();
+        // An unrelated plugin must not affect the verdict.
+        write(plugins_dir.join("browser4-captcha-4.14.1-SNAPSHOT.jar"), "jar").unwrap();
+
+        assert_eq!(local_bundle_plugin_warning(&root, &work_dir), None);
     }
 
     /// Regression test for the v4.14.0-rc.7 packaging defect: the installer
@@ -13331,6 +13501,42 @@ mod tests {
         // Unset and typos must not silently change the bundle policy.
         for value in [None, Some(""), Some("0"), Some("True"), Some("no"), Some("off")] {
             assert!(!env_flag_is_on(value), "{value:?} should be off");
+        }
+    }
+
+    /// `BROWSER4_CLI_FORCE_REBUILD_BUNDLE=1` is a no-op while a server is
+    /// already running; the already-running branch must say so instead of
+    /// letting the user believe a rebuild happened.
+    #[test]
+    fn force_rebuild_flag_announces_the_no_op_on_a_running_server() {
+        let _lock = lock_env_mutex();
+
+        let previous = env::var(FORCE_REBUILD_BUNDLE_ENV).ok();
+        unsafe { env::remove_var(FORCE_REBUILD_BUNDLE_ENV) };
+        assert_eq!(
+            force_rebuild_ignored_message(8283),
+            None,
+            "an unset flag must not print a notice"
+        );
+
+        unsafe { env::set_var(FORCE_REBUILD_BUNDLE_ENV, "1") };
+        let message = force_rebuild_ignored_message(8283).expect("the flag must be reported");
+        assert!(
+            message.contains("ignoring") && message.contains(FORCE_REBUILD_BUNDLE_ENV),
+            "notice must name the ignored flag: {message}"
+        );
+        assert!(
+            message.contains("8283"),
+            "notice must name the port holding the running server: {message}"
+        );
+        assert!(
+            message.contains("browser4-cli stop"),
+            "notice must name the way to make the flag take effect: {message}"
+        );
+
+        match previous {
+            Some(value) => unsafe { env::set_var(FORCE_REBUILD_BUNDLE_ENV, value) },
+            None => unsafe { env::remove_var(FORCE_REBUILD_BUNDLE_ENV) },
         }
     }
 

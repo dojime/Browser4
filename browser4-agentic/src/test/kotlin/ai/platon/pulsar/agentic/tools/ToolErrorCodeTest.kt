@@ -1,6 +1,8 @@
 package ai.platon.pulsar.agentic.tools
 
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNotEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.DisplayName
 import org.junit.jupiter.api.Test
@@ -80,6 +82,97 @@ class ToolErrorCodeTest {
         assertEquals(
             ToolErrorCode.CDP_ERROR,
             ToolErrorMapper.classify(IOException("CDP websocket closed"))
+        )
+    }
+
+    @Test
+    @DisplayName("a target lookup miss is a permanent not-found, never a retryable timeout")
+    fun targetLookupMissIsNotATimeout() {
+        val refMiss = "browser_evaluate failed: Element not found for ref backend:999. " +
+            "Refs expire after page changes — re-run `snapshot` to get fresh refs."
+
+        assertEquals(ToolErrorCode.TARGET_NOT_FOUND, ToolErrorMapper.classifyMessage(refMiss))
+        assertEquals(ToolErrorCode.TARGET_NOT_FOUND, ToolErrorMapper.classifyMessage("No element matches selector \"#nope\"."))
+        assertEquals(ToolErrorCode.TARGET_NOT_FOUND, ToolErrorMapper.classifyMessage("Frame not found: #no-such-frame."))
+        assertEquals(
+            ToolErrorCode.TARGET_NOT_FOUND,
+            ToolErrorMapper.classifyMessage(
+                "The selected frame 'payframe' is not reachable: the page navigated."
+            )
+        )
+        assertEquals(
+            ToolErrorCode.TARGET_NOT_FOUND,
+            ToolErrorMapper.classifyMessage("Option target not found: #size")
+        )
+        assertFalse(
+            ToolErrorCode.TARGET_NOT_FOUND.retryable,
+            "a stale ref never resolves by retrying the same call"
+        )
+    }
+
+    @Test
+    @DisplayName("a parameter named waitTimeout cannot make a failure look like a timeout")
+    fun parameterNamesDoNotDecideTheCode() {
+        // Regression: the dispatcher appends the tool description to an error,
+        // and the evaluate tool documents a `waitTimeout` parameter — the bare
+        // "timeout" substring match turned a stale-ref failure into a retryable
+        // TIMEOUT (HTTP 504, "retry with a longer timeout").
+        val composed = "browser_evaluate failed: Element not found for ref backend:999. " +
+            "Refs expire after page changes — re-run `snapshot` to get fresh refs. " +
+            "help: Evaluate JavaScript in the page. Arguments: waitTimeout: How long to wait for the selector."
+
+        assertEquals(ToolErrorCode.TARGET_NOT_FOUND, ToolErrorMapper.classifyMessage(composed))
+        assertNotEquals(ToolErrorCode.TIMEOUT, ToolErrorMapper.classifyMessage("waitTimeout is not a number"))
+
+        // A real timeout report still classifies as one — the word, not the
+        // substring, is what counts.
+        assertEquals(ToolErrorCode.TIMEOUT, ToolErrorMapper.classifyMessage("navigation timed out after 30s"))
+        assertEquals(ToolErrorCode.TIMEOUT, ToolErrorMapper.classifyMessage("timeout while waiting for the page"))
+    }
+
+    @Test
+    @DisplayName("a pending native dialog is its own non-retryable state")
+    fun dialogPendingIsItsOwnCode() {
+        val parkedClick = "browser_click failed: The click opened a native confirm dialog: \"Confirm action\" " +
+            "and is paused until the dialog is handled. Run 'dialog-accept' (or 'dialog-dismiss') to let " +
+            "the click finish; do not re-run the click."
+
+        assertEquals(ToolErrorCode.DIALOG_PENDING, ToolErrorMapper.classifyMessage(parkedClick))
+        assertEquals(
+            ToolErrorCode.DIALOG_PENDING,
+            ToolErrorMapper.classifyMessage("Page is blocked by a native confirm dialog: \"Confirm action\".")
+        )
+        assertFalse(ToolErrorCode.DIALOG_PENDING.retryable, "re-running the action would duplicate its effect")
+    }
+
+    @Test
+    @DisplayName("an X-SQL statement rejection is a client-input error, not a server fault")
+    fun rejectedXSqlIsAClientError() {
+        assertEquals(
+            ToolErrorCode.INVALID_ARGUMENT,
+            ToolErrorMapper.classifyMessage("Only select statements are supported")
+        )
+        assertEquals(
+            ToolErrorCode.INVALID_ARGUMENT,
+            ToolErrorMapper.classifyMessage("Only one statement is supported")
+        )
+        assertEquals(400, ToolErrorCode.INVALID_ARGUMENT.httpStatus)
+    }
+
+    @Test
+    @DisplayName("a coded failure keeps its own code through a wrapper")
+    fun codedNotFoundKeepsItsCode() {
+        val failure = TargetNotFoundException("Element not found for ref e9999.")
+
+        assertEquals(ToolErrorCode.TARGET_NOT_FOUND, ToolErrorMapper.classify(failure))
+        assertEquals(
+            ToolErrorCode.TARGET_NOT_FOUND,
+            ToolErrorMapper.classify(IllegalStateException("wrapped", failure)),
+            "a wrapper must not lose the classification of its cause"
+        )
+        assertTrue(
+            failure !is IllegalArgumentException,
+            "an IllegalArgumentException is read as a usage error and gets the tool signature dump"
         )
     }
 

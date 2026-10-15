@@ -55,7 +55,7 @@ The snapshot file path is printed to stderr after capture. Snapshot files can be
 ```bash
 browser4-cli snapshot [--viewport N|-v N] [--stdout] [--json] [--quiet]   # capture accessibility tree
 browser4-cli snapshot --auto-diff [--viewport N|-v N]                      # diff vs previous snapshot
-browser4-cli snapshot --interactive|-i [--viewport N|-v N]                 # interactive-oriented rendering (text merged into names — not a strict filter)
+browser4-cli snapshot --interactive|-i [--viewport N|-v N]                 # interactive-only mode
 browser4-cli snapshot --stdout --page N                                    # paginate stdout output
 browser4-cli snapshot grep [OPTIONS] <pattern>                             # search snapshot content with regex
 ```
@@ -147,13 +147,32 @@ Refs are **ephemeral** — they become invalid after commands that change the DO
 
 ## Interactive Mode
 
-`--interactive` (`-i`) switches the snapshot into **interactive-oriented rendering**: the AX capture aggregates inner text into the enclosing element's name, so each ref line reads as a self-contained target (e.g. a `<header>`/`banner` line carries the text of everything inside it).
+`--interactive` (`-i`) switches the snapshot into **interactive-only rendering**: only interactive
+elements survive — buttons, links, inputs/textboxes, and pointer (`cursor:pointer`) elements. Inner
+text is merged into each surviving element's name, so its ref line reads as a self-contained target.
+`-i` is a **strict filter**, not a relayout: everything else is dropped, or reduced to plain `text:`
+lines without refs.
 
-> **`-i` removes refs from structural elements.** Headings, paragraphs and list items that carry refs in default mode are rendered as plain `text:` lines without refs in `-i` mode. Use `-i` when you need compact, readable ref lines for interactive controls (links, buttons, inputs); use default mode when you need refs on structural elements too.
+> **Warning:** Draggable items (`li[draggable=true]`, `cursor:grab`) and hover-only targets (e.g.
+> tooltip spans) are not treated as interactive, so they lose their refs under `-i` — and combined
+> with `-v` they disappear from the output entirely. Plain `snapshot -v 0` (or the default full
+> snapshot) still returns their refs.
+
+`-i` and `-v` compose: adding `-v` narrows the result to the interactive elements inside that single
+viewport chunk. So `-i -v 0` is a focused interactive screenful — **not** a filtered full tree.
 
 ```bash
-browser4-cli snapshot -i        # interactive-oriented rendering (text merged into names)
-browser4-cli snapshot -i -v 0   # same, but only the current screenful — the reliable way to bound output size
+browser4-cli snapshot -i        # interactive-only rendering (text merged into names)
+browser4-cli snapshot -i -v 0   # interactive elements in the current screenful — not a full tree
+```
+
+**Draggable or hover-revealed targets** (the usual targets of `drag`, `hover` and `dblclick`):
+snapshot the plain way, act from those refs, then re-snapshot after acting.
+
+```bash
+browser4-cli snapshot -v 0                    # refs for all on-screen elements, draggable included
+browser4-cli drag <source-ref> <target-ref>   # act using those refs
+browser4-cli snapshot -v 0                    # re-snapshot: refs are invalidated by the interaction
 ```
 
 To keep the output genuinely small and focused, use:
@@ -163,7 +182,9 @@ To keep the output genuinely small and focused, use:
 - `-d, --depth <N>` — limit tree depth
 - `htmlsnapshot` — CSS-selector extraction when you do not need refs
 
-> **Warning:** Do not rely on `-i` to shrink large snapshots or to strip product-card containers — addressable non-interactive elements remain. For shopping/search pages prefer `-v 0` viewport pagination or `htmlsnapshot` for selector-based extraction.
+> **Note:** Extending the interactive heuristic to draggable/hover-revealed elements is expected,
+> so those refs stop silently disappearing. Until then, do not use `-i` as the only orientation
+> view before acting.
 
 ## Output Modes
 
@@ -241,7 +262,7 @@ browser4-cli snapshot -v 0 --json   # clean JSON for scripts/agents
 | `--stdout` | Print snapshot to stdout instead of saving to file. Large trees are paginated (default 2000 lines/page); when truncated, a hint is appended to stdout when piped and the full footer goes to stderr. |
 | `--raw` | Alias of `--stdout` — strip page info and print only snapshot content. |
 | `--auto-diff` | Diff against the previous **deliberate** snapshot (skips auto-snapshots after interactions). After a navigation or interaction that changes the page, `click <ref> --no-snapshot` preserves the pre-interaction baseline for a clean diff. |
-| `--interactive`, `-i` | Interactive-oriented rendering: inner text is aggregated into the enclosing element's name so ref lines read as self-contained targets. In `-i` mode headings, paragraphs and list items lose their refs and become plain `text:` lines; use default mode when you need refs on structural elements. |
+| `--interactive`, `-i` | Interactive-only rendering (strict filter); see Interactive Mode. |
 | `--json` | Single-line JSON envelope on stdout only. All tips, hints, and warnings are suppressed. |
 | `--quiet`, `-q` | Suppress all normal output; only errors appear on stderr. |
 | `--page N` | When used with `--stdout`, show only page N of the output (1-based). |
@@ -255,7 +276,7 @@ browser4-cli snapshot -v 0 --json   # clean JSON for scripts/agents
 | `snapshot --stdout` dumps a huge tree | Full page captured; stdout output is paginated at 2000 lines/page by default, but a single page is still large | Use `-v 0` viewport chunks, or `--stdout --page N` / `--page-size N`; `--all` / `--page-size 0` for the complete tree; `snapshot grep` for targeted reads |
 | `snapshot grep` finds nothing | Pattern doesn't match the accessibility tree (refs/labels, not raw HTML) | Match against element names and labels; use `htmlsnapshot grep` for raw HTML; check exit code (`1` = no matches) |
 | `snapshot --selector` returns an error | The CSS selector matched no element on the page | Verify the selector with `htmlsnapshot get text "<sel>"` first |
-| Missing elements in `-i` mode | Interactive mode strips refs from headings/paragraphs/list items (renders them as plain `text:` lines) | Use default mode for structural refs, or `htmlsnapshot` for CSS-based extraction |
+| Missing refs in `-i` mode | Strict interactive-only filter | Use `snapshot -v 0` instead |
 | Stale refs after interaction | Refs are single-use handles | Re-snapshot after any interaction — see [SKILL.md §5](../SKILL.md#5-critical-warnings) |
 
 ## Critical Warnings
@@ -264,7 +285,9 @@ browser4-cli snapshot -v 0 --json   # clean JSON for scripts/agents
 
 > **Note:** Warning: refs are single-use — re-snapshot after any interaction — see [SKILL.md §5](../SKILL.md#5-critical-warnings)
 
-> **Warning:** Interactive mode (`snapshot -i`) strips refs from headings, paragraphs and list items (they become plain `text:` lines). Prefer `-v 0` viewport pagination or `htmlsnapshot` for shopping/search pages where you need small, focused output.
+> **Warning:** `snapshot -i` is a strict interactive-only filter: draggable items (`cursor:grab`)
+> and hover-only targets (e.g. tooltip spans) lose their refs; with `-v` they vanish entirely.
+> Orient with a plain `snapshot -v 0` before acting (see Interactive Mode).
 
 ## See Also
 

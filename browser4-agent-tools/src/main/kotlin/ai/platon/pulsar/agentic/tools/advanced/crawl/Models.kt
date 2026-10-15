@@ -89,11 +89,41 @@ data class ScrapeResponse(
      * Wall-clock duration of the task in milliseconds: `startedTime -> finishTime`
      * for a task that ran to completion, `createdTime -> finishTime` for one that
      * never started, and null while the task is still running.
+     *
+     * This is *processing* time only — the queue wait is
+     * [`queuedMillis`][queuedMillis], and the total time to result is
+     * `createdTime -> finishTime`.
      */
     val durationMillis: Long?
         get() {
             val end = finishTime ?: return null
             val start = startedTime ?: createdTime ?: return null
+            return java.time.Duration.between(start, end).toMillis().coerceAtLeast(0)
+        }
+
+    /**
+     * How long the task waited in the queue before a worker picked it up
+     * (`createdTime -> startedTime`), or null while it is still queued.
+     *
+     * Reported separately from [durationMillis] because that split is the whole
+     * difference between "the work is slow" and "the pool is busy" — a distinction
+     * a single duration number cannot make.
+     */
+    val queuedMillis: Long?
+        get() {
+            val start = startedTime ?: return null
+            val created = createdTime ?: return null
+            return java.time.Duration.between(created, start).toMillis().coerceAtLeast(0)
+        }
+
+    /**
+     * Total time from submission to result (`createdTime -> finishTime`), or null
+     * while the task is still running.
+     */
+    val elapsedMillis: Long?
+        get() {
+            val end = finishTime ?: return null
+            val start = createdTime ?: return null
             return java.time.Duration.between(start, end).toMillis().coerceAtLeast(0)
         }
 
@@ -146,7 +176,19 @@ fun ScrapeResponse.failed(statusCode: Int): ScrapeResponse {
 
 fun ScrapeResponse.emitEvent(event: String) {
     this.event = event
-    this.lastModifiedTime = Instant.now()
+    val now = Instant.now()
+    this.lastModifiedTime = now
+    // The FIRST event of a task is emitted when a worker actually starts the work
+    // (the load pipeline's `onWillLoad`), which is exactly when the task leaves the
+    // queue — so this is where `startedTime` belongs.
+    //
+    // Leaving it to `refresh()`/`complete()` instead stamped the task's start at the
+    // moment it *finished* for every worker that reported only terminal updates
+    // (swarm query tasks): `startedTime == finishTime` made the reported duration a
+    // handful of milliseconds and hid the queue wait completely.
+    if (startedTime == null) {
+        startedTime = now
+    }
 }
 
 fun ScrapeResponse.failed(statusCode: Int, pageStatusCode: Int): ScrapeResponse {

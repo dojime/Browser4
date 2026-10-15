@@ -618,7 +618,10 @@ function Get-JdepsClassPath([string]$libDirectory) {
 function Get-BundleMetadataJson(
     [string]$assetName,
     [string[]]$modules,
-    [string]$mainClass
+    [string]$mainClass,
+    [string[]]$plugins = @(),
+    [string]$pluginVersion = '',
+    [string[]]$pluginWarnings = @()
 ) {
     $metadata = [ordered]@{
         assetName = $assetName
@@ -627,6 +630,13 @@ function Get-BundleMetadataJson(
         libDirectoryName = 'lib'
         pluginsDirectoryName = 'plugins'
         modules = $modules
+        # Bundled plugin JARs and any reason the plugin could not be bundled.
+        # Recorded here because the CLI prints a successful build's stdout only
+        # on failure — the manifest is what makes a plugin-less bundle auditable
+        # instead of silent (every /api/swarm/** call would answer 503).
+        plugins = $plugins
+        pluginVersion = $pluginVersion
+        pluginWarnings = $pluginWarnings
         builtAtUtc = [DateTime]::UtcNow.ToString('o')
     }
     return ($metadata | ConvertTo-Json -Depth 6)
@@ -974,23 +984,194 @@ Write-Host "Collected $libJarCount jars in lib/" -ForegroundColor Green
 # --------------------------------------------------------------------------
 # Bundle the browser4-swarm plugin (the swarm REST facade is a thin shell that
 # delegates to this plugin; without it /api/swarm/** returns 503).
+#
+# Two failures made this step ship a bundle with no (or a version-skewed)
+# plugin, and both were invisible in the CLI's rebuild output:
+#   1. the local repository was assumed to be ~/.m2/repository although a
+#      settings.xml that declares <localRepository> moves every artifact
+#      Maven installs (common on Windows, where a redirected D: repository
+#      keeps C: free) — the scan then found nothing and copied nothing;
+#   2. the newest JAR by mtime won, so a plugin from another release train
+#      could be bundled into this backend.
+# The plugin outcome is therefore recorded in the bundle metadata and reported
+# at the end of the build (the CLI prints the build's own stdout/stderr only
+# when the build fails, so the metadata is what other tools can read).
 # --------------------------------------------------------------------------
-$localRepo = if ($env:MAVEN_REPO_LOCAL) {
-    $env:MAVEN_REPO_LOCAL
-} else {
-    $homeDir = if ($env:HOME) { $env:HOME } else { $env:USERPROFILE }
-    [System.IO.Path]::Combine($homeDir, '.m2', 'repository')
+
+function Get-CheckedOutProjectVersion([string]$repositoryRoot) {
+    <#
+    .SYNOPSIS
+        Read the project version of the checkout (used to match the plugin JAR).
+    .DESCRIPTION
+        Mirrors the CLI's dev-mode staleness check: the <version> that belongs
+        to the root artifact (<artifactId>browser4</artifactId>), not the parent
+        POM version declared above it.  Falls back to the VERSION file.
+    #>
+    $pomPath = [System.IO.Path]::Combine($repositoryRoot, 'pom.xml')
+    if (Test-Path -LiteralPath $pomPath) {
+        $pom = Get-Content -LiteralPath $pomPath -Raw
+        $marker = '<artifactId>browser4</artifactId>'
+        $markerIndex = $pom.IndexOf($marker, [System.StringComparison]::Ordinal)
+        if ($markerIndex -ge 0) {
+            $rest = $pom.Substring($markerIndex + $marker.Length)
+            $head = if ($rest.Length -gt 512) { $rest.Substring(0, 512) } else { $rest }
+            if ($head -match '<version>\s*([^<]+?)\s*</version>') {
+                return $Matches[1].Trim()
+            }
+        }
+    }
+
+    $versionPath = [System.IO.Path]::Combine($repositoryRoot, 'VERSION')
+    if (Test-Path -LiteralPath $versionPath) {
+        return ([string](Get-Content -LiteralPath $versionPath -TotalCount 1)).Trim()
+    }
+
+    return ''
 }
+
+function Resolve-MavenLocalRepository([string]$mavenCommand) {
+    <#
+    .SYNOPSIS
+        Resolve Maven's effective local repository, never assuming ~/.m2.
+    .DESCRIPTION
+        Order: MAVEN_REPO_LOCAL override > Maven's own answer
+        (`mvn -q help:evaluate -Dexpression=settings.localRepository
+        -DforceStdout`) > a settings.xml scan (user settings, then the global
+        settings of MAVEN_HOME / M2_HOME) > ~/.m2/repository.
+
+        The settings.xml scan is a regex over the raw file so it also works
+        under PowerShell's ConstrainedLanguage mode and does not care about
+        namespaces or a BOM.
+    #>
+    if ($env:MAVEN_REPO_LOCAL) { return $env:MAVEN_REPO_LOCAL }
+
+    if ($mavenCommand) {
+        try {
+            # -q keeps Maven quiet; -DforceStdout prints the value alone on
+            # stdout.  A failure (offline, missing help plugin) leaves nothing
+            # usable, so the settings.xml scan below still runs.
+            $evaluated = @(& $mavenCommand -q 'help:evaluate' '-Dexpression=settings.localRepository' '-DforceStdout' 2>$null)
+            for ($i = $evaluated.Count - 1; $i -ge 0; $i--) {
+                $candidate = ([string]$evaluated[$i]).Trim().Trim('"')
+                if ($candidate -and ($candidate -match '^[A-Za-z]:[\\/]' -or $candidate -match '^/')) {
+                    return $candidate
+                }
+            }
+        } catch {
+            # Fall through to the settings.xml scan.
+        }
+    }
+
+    $homeDir = if ($env:HOME) { $env:HOME } elseif ($env:USERPROFILE) { $env:USERPROFILE } else { '' }
+
+    $settingsCandidates = @()
+    if ($env:MAVEN_USER_HOME) { $settingsCandidates += [System.IO.Path]::Combine($env:MAVEN_USER_HOME, 'settings.xml') }
+    if ($homeDir) { $settingsCandidates += [System.IO.Path]::Combine($homeDir, '.m2', 'settings.xml') }
+    foreach ($mavenHome in @($env:MAVEN_HOME, $env:M2_HOME)) {
+        if ($mavenHome) { $settingsCandidates += [System.IO.Path]::Combine($mavenHome, 'conf', 'settings.xml') }
+    }
+    foreach ($settingsPath in $settingsCandidates) {
+        if (-not (Test-Path -LiteralPath $settingsPath -PathType Leaf)) { continue }
+        try {
+            $raw = Get-Content -LiteralPath $settingsPath -Raw -ErrorAction Stop
+        } catch {
+            continue
+        }
+        if ($raw -match '(?s)<localRepository>\s*([^<]+?)\s*</localRepository>') {
+            $declared = $Matches[1].Trim()
+            if ($declared.StartsWith('~') -and $homeDir) {
+                $declared = [System.IO.Path]::Combine($homeDir, $declared.Substring(1).TrimStart('/', '\'))
+            }
+            if ($declared) { return $declared }
+        }
+    }
+
+    if ($homeDir) { return [System.IO.Path]::Combine($homeDir, '.m2', 'repository') }
+    return ''
+}
+
+function Get-PluginVersionFromJarName([string]$jarName) {
+    <#
+    .SYNOPSIS
+        Extract the version from 'browser4-swarm-<version>[-classifier].jar'.
+    .OUTPUTS
+        String — the parsed version, or '' when the name does not match.
+    #>
+    if ($jarName -match '^browser4-swarm-(.+)\.jar$') { return $Matches[1] }
+    return ''
+}
+
+$projectVersion = Get-CheckedOutProjectVersion -repositoryRoot $repoRoot
+$localRepo = Resolve-MavenLocalRepository -mavenCommand $mvnCmd
 $swarmGroupDir = [System.IO.Path]::Combine($localRepo, 'ai', 'platon', 'pulsar', 'browser4-swarm')
-$swarmJar = Get-ChildItem -Path $swarmGroupDir -Recurse -File -Filter 'browser4-swarm-*.jar' -ErrorAction SilentlyContinue |
-    Where-Object { $_.Name -notmatch 'sources|javadoc' } |
-    Sort-Object LastWriteTime -Descending |
-    Select-Object -First 1
+
+$pluginBundleWarnings = [System.Collections.Generic.List[string]]::new()
+$bundledPluginNames = [System.Collections.Generic.List[string]]::new()
+$bundledPluginVersion = ''
+$swarmJar = $null
+
+Write-Host "Maven local repository: $localRepo" -ForegroundColor DarkGray
+if ($projectVersion) {
+    Write-Host "Checked-out project version: $projectVersion" -ForegroundColor DarkGray
+}
+
+$pluginCandidates = @(
+    Get-ChildItem -Path $swarmGroupDir -Recurse -File -Filter 'browser4-swarm-*.jar' -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -notmatch 'sources|javadoc' }
+)
+
+$swarmInstallHint = "Install the matching plugin and rebuild the bundle:`n" +
+    "    mvn install -pl browser4-plugins/browser4-swarm -DskipTests`n" +
+    "    (or run this script again with -SkipMavenInstall after installing it)"
+
+if ($pluginCandidates.Count -eq 0) {
+    $pluginBundleWarnings.Add(
+        "No browser4-swarm plugin JAR found under $swarmGroupDir. " +
+        "Every /api/swarm/** endpoint will answer 503 until the plugin is installed.`n" +
+        $swarmInstallHint)
+} else {
+    $versionedCandidates = @(
+        foreach ($candidate in $pluginCandidates) {
+            @{ Jar = $candidate; Version = (Get-PluginVersionFromJarName -jarName $candidate.Name) }
+        }
+    )
+    $matchingCandidates = @(
+        $versionedCandidates | Where-Object {
+            $_.Version -and $projectVersion -and $_.Version.Equals($projectVersion, [System.StringComparison]::OrdinalIgnoreCase)
+        }
+    )
+
+    if ($matchingCandidates.Count -gt 0) {
+        # Version first; only same-version JARs (e.g. several snapshot installs)
+        # are ranked by mtime.
+        $swarmJar = ($matchingCandidates | Sort-Object { $_.Jar.LastWriteTime } -Descending | Select-Object -First 1).Jar
+    } else {
+        $foundVersions = @(
+            $versionedCandidates |
+                ForEach-Object { $_.Version } |
+                Where-Object { $_ } |
+                Sort-Object -Unique
+        ) -join ', '
+        if (-not $foundVersions) { $foundVersions = '(unparseable JAR names)' }
+        $pluginBundleWarnings.Add(
+            "Found browser4-swarm JAR(s) for other versions in $swarmGroupDir, but none for the " +
+            "checked-out project version '$projectVersion' (found: $foundVersions). " +
+            "Refusing to bundle a plugin from another release train — a version-skewed plugin " +
+            "looks installed while behaving unpredictably.`n" +
+            $swarmInstallHint)
+    }
+}
+
 if ($swarmJar) {
     Copy-Item -LiteralPath $swarmJar.FullName -Destination (Join-Path $pluginsDirectory $swarmJar.Name) -Force
+    $bundledPluginNames.Add($swarmJar.Name)
+    $bundledPluginVersion = Get-PluginVersionFromJarName -jarName $swarmJar.Name
     Write-Host "  + Plugin: $($swarmJar.Name)" -ForegroundColor Green
 } else {
-    Write-Warning "browser4-swarm plugin JAR not found in the local Maven repo ($swarmGroupDir). Swarm REST endpoints will return 503 until the plugin is installed."
+    foreach ($warning in $pluginBundleWarnings) {
+        Write-Host ''
+        Write-Host "WARNING: $warning" -ForegroundColor Yellow
+    }
 }
 
 # --------------------------------------------------------------------------
@@ -1539,7 +1720,9 @@ if (-not $SkipCli) {
 }
 
 Set-Content -LiteralPath (Join-Path $bundleDirectory 'runtime-bundle.json') `
-    -Value (Get-BundleMetadataJson -assetName $AssetName -modules $modules -mainClass $MainClass) `
+    -Value (Get-BundleMetadataJson -assetName $AssetName -modules $modules -mainClass $MainClass `
+        -plugins $bundledPluginNames.ToArray() -pluginVersion $bundledPluginVersion `
+        -pluginWarnings $pluginBundleWarnings.ToArray()) `
     -Encoding UTF8
 
 # --------------------------------------------------------------------------
@@ -1584,3 +1767,22 @@ Complete-BuildProgress
 
 $assetSize = [math]::Round(((Get-Item $assetPath).Length / 1MB), 2)
 Write-Host "Browser4 runtime bundle created: $assetPath ($assetSize MB)" -ForegroundColor Green
+
+# --------------------------------------------------------------------------
+# Plugin report — repeated here, at the very end, because this is the part of
+# the output a human actually reads; a Write-Warning in the middle of a long
+# build scrolls away, and the CLI only echoes a *failing* build's output.
+# --------------------------------------------------------------------------
+if ($bundledPluginNames.Count -gt 0) {
+    Write-Host "Bundled plugins: $($bundledPluginNames -join ', ')" -ForegroundColor Green
+} else {
+    Write-Host ''
+    Write-Host '!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!' -ForegroundColor Yellow
+    Write-Host ' WARNING: this bundle ships NO plugins.' -ForegroundColor Yellow
+    Write-Host ' Every /api/swarm/** endpoint will answer 503 "Swarm backend is not installed".' -ForegroundColor Yellow
+    foreach ($warning in $pluginBundleWarnings) {
+        Write-Host "   - $warning" -ForegroundColor Yellow
+    }
+    Write-Host ' The condition is also recorded in the bundle manifest (pluginWarnings).' -ForegroundColor Yellow
+    Write-Host '!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!' -ForegroundColor Yellow
+}

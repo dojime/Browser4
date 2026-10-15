@@ -56,6 +56,15 @@ All four accept `-s <session>` (DEFAULT session otherwise) and `--json`.
 - **No auto-snapshot:** `tab-list`, `tab-new`, `tab-close` and `tab-select` do NOT trigger
   automatic snapshots. After `tab-select`, run `snapshot` explicitly to get fresh element refs for
   the new active tab — the switch changes the active page context.
+- **`window new` is an alias of `tab-new` here:** in the managed/headless backend both commands
+  create an additional tab/target in the same browser and auto-select it, printing the same
+  `Created tab with GUID: …` / `✓ Switched to tab <n>` lines. A separate OS window is a headed-mode
+  artifact, not something the command controls.
+- **Popups:** a page-opened popup (`window.open`, `target="_blank"`) is an ordinary new target.
+  The CLI does not announce it and does not switch to it (auto-select lives in the `tab-new` /
+  `window new` dispatch), so run `tab-list` after triggering the popup and switch explicitly with
+  `tab-select <index>` or `--guid <guid>`. **Note:** whether every popup type is registered in
+  `tab-list` is not covered by tests yet — verify on your build.
 - **Extension sessions:** When closing tabs on extension-attached sessions, the backend may report
   an error even though the tab was successfully closed (Chrome's `chrome.tabs.remove` callback can
   fire an error after the tab is already gone). The CLI verifies that the tab was actually removed

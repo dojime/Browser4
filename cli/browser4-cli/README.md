@@ -117,7 +117,7 @@ report the skew). See [CLI install & upgrade](../../docs/cli-install-upgrade.md#
 
 | Command | Description |
 |---|---|
-| `snapshot` | Capture page snapshot to obtain element refs. Supports `--boxes`, `-i`/`--interactive`, `-u`/`--urls`, `-c`/`--compact`, `-d`/`--depth <n>`, `--selector <sel>`, `--raw`, `--stdout`. `--stdout`/`--raw` paginate large trees at 2000 lines/page by default (truncated output appends a hint to stdout when piped; footer goes to stderr) — use `--page N`, `--page-size N`, or `--all`/`--page-size 0` for the complete tree |
+| `snapshot` | Capture page snapshot to obtain element refs. Supports `--boxes`, `-i`/`--interactive` (interactive-**only**: buttons/links/inputs/`cursor:pointer` — draggable and hover-only targets lose their refs, so use `-v 0` for those), `-u`/`--urls`, `-c`/`--compact`, `-d`/`--depth <n>`, `--selector <sel>`, `--raw`, `--stdout`. `--stdout`/`--raw` paginate large trees at 2000 lines/page by default (truncated output appends a hint to stdout when piped; footer goes to stderr) — use `--page N`, `--page-size N`, or `--all`/`--page-size 0` for the complete tree |
 | `get <mode> <selector> [name]` | Extract data from a page element (text, html, box, styles, property, attr) |
 | `eval [expression] [ref]` | Evaluate JavaScript expression on page or element |
 | `wait [target]` | Wait for a condition: element, time, text, URL pattern, page load, or JS expression |
@@ -187,7 +187,7 @@ frames) are not supported in this version — `frames` cannot see them and
 | Command | Description |
 |---|---|
 | `download [--dir <path>] [--behavior allow\|deny]` | Configure the browser download folder (`Browser.setDownloadBehavior`) |
-| `wait --download [--dir <path>] [--timeout <ms>]` | Poll the download directory until a download completes |
+| `wait --download [--dir <path>] [--timeout <ms>]` | Poll the download directory until a download completes. Success means "some non-partial file exists and no `.crdownload`/`.tmp`/`.part` file does", so a directory that already contains a file reports completion instantly — point it at an empty directory (or clean it first) |
 
 ### Network inspection, HAR & routing
 
@@ -240,7 +240,7 @@ extensions) are also possible via `open --profile` or PROTOTYPE mode. See
 
 | Command | Description |
 |---|---|
-| `extract <instruction>` | Extract structured data from the current page |
+| `extract <instruction>` | Extract data from the current page. Without `--schema` the result is always the fixed `{title, content, links}` envelope — the instruction shapes the text inside `content`; pass `--schema` (JSON Schema or `{"fields":[…]}`) to get named top-level fields |
 | `agent run <task>` | Run an autonomous agent task (async, returns task ID). `--wait` blocks for the result; `--wait-timeout <seconds>` tunes the wait window (default 600). |
 | `agent status <id>` | Check the status of a running agent task |
 | `agent result <id>` | Get the result of a completed agent task |
@@ -430,7 +430,7 @@ Skills are AI agent instruction files bundled into the CLI binary at compile tim
 | `webminer version` | Show installed and latest available versions |
 | `webminer uninstall` | Remove the installed release |
 | `webminer run-example` | Download the sample dataset and run the full pipeline (needs 7-Zip) |
-| `webminer all <html-dir>` | Full pipeline (encode → cluster → views) with `--max-files`, `--output`, `--resume` |
+| `webminer all <html-dir>` | Full pipeline (encode → cluster → views) with `--max-files` (default **40** — raise it for larger corpora, the run truncates silently), `--output`, `--resume`. The interactive report and encoded dataset go to the OS temp dir (`%TEMP%/webminer-pereg/…`), not `--output` |
 | `webminer views <result-dir>` | Rebuild interactive views from an existing clustering result |
 
 Any other command is forwarded verbatim to `scent-miner.jar` (e.g. `webminer encode <dir>`). The same `~/.scent/webminer` installation is used by the [web-miner skill](../../skills/browser4-web-miner/SKILL.md).

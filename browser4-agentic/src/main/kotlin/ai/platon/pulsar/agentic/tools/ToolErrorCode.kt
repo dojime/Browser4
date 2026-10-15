@@ -43,11 +43,33 @@ enum class ToolErrorCode(
     /** The domain needs a receiver this deployment cannot supply. */
     TARGET_UNAVAILABLE(false, 503, "The domain is registered but has no bound receiver in this deployment."),
 
+    /**
+     * The target the caller named — a snapshot element ref, a CSS selector, a
+     * frame — does not resolve in the live page.
+     *
+     * Retrying the identical call can never help: refs are ephemeral and a
+     * selector is what it is, so a client must re-read the page instead. It is
+     * emphatically *not* [TIMEOUT]: the failure is immediate and permanent, and
+     * reporting it as retryable sent agents into pointless retry loops. It is
+     * not a usage error either — the call's shape was fine, the page simply did
+     * not contain the target.
+     */
+    TARGET_NOT_FOUND(false, 404, "Re-run `snapshot` for fresh refs, or check the selector and the active frame (`frames`)."),
+
     /** Too many calls for this tool/session. */
     RATE_LIMITED(true, 429, "Wait for the reported retry-after and retry."),
 
     /** The tool did not finish in time. */
     TIMEOUT(true, 504, "Retry with a longer timeout, or poll the task status."),
+
+    /**
+     * A native JavaScript dialog (alert/confirm/prompt) is blocking the page.
+     *
+     * The action is parked, not lost: accepting or dismissing the dialog lets it
+     * finish, so re-running it would duplicate the effect. Non-retryable on
+     * purpose — the caller must handle the dialog first.
+     */
+    DIALOG_PENDING(false, 409, "Run dialog-accept or dialog-dismiss to release the page, then re-run the action only if it did not complete."),
 
     /** The browser rejected the command. */
     CDP_ERROR(true, 502, "The browser refused the command; retrying may help."),
@@ -83,6 +105,30 @@ enum class ToolErrorCode(
 interface CodedFailure {
     val code: ToolErrorCode
 }
+
+/**
+ * A target the caller named does not exist in the live page.
+ *
+ * Thrown when a syntactically valid target — an `eN` snapshot ref, a CSS
+ * selector, a frame — cannot be resolved. Two things follow from that, and both
+ * are why this is a type rather than a string:
+ *
+ * - [code] is [ToolErrorCode.TARGET_NOT_FOUND], so the client is told to re-read
+ *   the page instead of retrying a call that can never succeed (the previous
+ *   `IllegalArgumentException` reached the client as `TIMEOUT`, which is
+ *   declared retryable);
+ * - it deliberately does **not** extend `IllegalArgumentException`, which
+ *   `MCPToolController.isUsageError` reads as "the caller misused the tool" and
+ *   answers with the tool's signature/help dump. A lookup miss on a valid call
+ *   must not be explained as a syntax mistake.
+ *
+ * @property code the wire code; [ToolErrorCode.TARGET_NOT_FOUND] unless a caller
+ *   has a better one (an unsupported locator kind, say).
+ */
+class TargetNotFoundException(
+    message: String,
+    override val code: ToolErrorCode = ToolErrorCode.TARGET_NOT_FOUND,
+) : RuntimeException(message), CodedFailure
 
 /**
  * Maps a failure to a [ToolErrorCode].
@@ -141,6 +187,15 @@ object ToolErrorMapper {
             "unsupported receiver" in text -> ToolErrorCode.TARGET_UNAVAILABLE
             "custom domain" in text && "no target" in text -> ToolErrorCode.TARGET_UNAVAILABLE
 
+            // Checked before the argument patterns below: a lookup miss on a
+            // valid call must not be read as a malformed one.
+            isTargetMiss(text) -> ToolErrorCode.TARGET_NOT_FOUND
+
+            // A pending native dialog parks the action rather than failing it —
+            // report it as its own state, never as INTERNAL and never as
+            // something to blindly retry.
+            "opened a native" in text || "blocked by a native" in text -> ToolErrorCode.DIALOG_PENDING
+
             "missing required parameter" in text -> ToolErrorCode.MISSING_REQUIRED_ARG
             "missing parameter" in text -> ToolErrorCode.MISSING_REQUIRED_ARG
             "is required" in text -> ToolErrorCode.MISSING_REQUIRED_ARG
@@ -154,8 +209,16 @@ object ToolErrorMapper {
             "unsupported method" in text -> ToolErrorCode.UNKNOWN_TOOL
             "extraneous parameter" in text -> ToolErrorCode.UNKNOWN_ARGUMENT
 
+            // The X-SQL pre-validation rejects a statement it will not run
+            // (non-SELECT, multi-statement, forbidden verb) — a client-input
+            // rejection, so it must not be reported as a server fault.
+            "only select statements are supported" in text -> ToolErrorCode.INVALID_ARGUMENT
+            "only one statement is supported" in text -> ToolErrorCode.INVALID_ARGUMENT
+            "statement is forbidden" in text -> ToolErrorCode.INVALID_ARGUMENT
+            "argument is not allowed" in text -> ToolErrorCode.INVALID_ARGUMENT
+
             "rate limit" in text || "too many requests" in text -> ToolErrorCode.RATE_LIMITED
-            "timed out" in text || "timeout" in text -> ToolErrorCode.TIMEOUT
+            isTimeoutPhrase(text) -> ToolErrorCode.TIMEOUT
             "cancelled" in text || "canceled" in text -> ToolErrorCode.CANCELLED
 
             "cdp" in text || "devtools" in text || "browserprotocol" in text -> ToolErrorCode.CDP_ERROR
@@ -170,4 +233,34 @@ object ToolErrorMapper {
             else -> ToolErrorCode.INTERNAL
         }
     }
+
+    /**
+     * True when [message] reports a target the live page does not contain.
+     *
+     * Shared with the help-text decision in the REST dispatcher, so the two can
+     * never disagree about whether a lookup miss is a usage error.
+     */
+    fun isTargetMiss(message: String): Boolean {
+        val text = message.lowercase()
+        return "element not found for ref" in text ||
+            "no element matches selector" in text ||
+            "option target not found" in text ||
+            "option target could not be resolved" in text ||
+            "frame not found" in text ||
+            ("selected frame" in text && "not reachable" in text)
+    }
+
+    /**
+     * True when [text] (already lowercased) reports a timeout.
+     *
+     * Token-aware on purpose: a bare `"timeout" in text` matched the *parameter
+     * name* `waitTimeout` inside the tool description the dispatcher appended to
+     * a stale-ref failure, so a permanent not-found error came back as a
+     * retryable [ToolErrorCode.TIMEOUT]. Parameter names must not decide a
+     * status code; only the words that report one may.
+     */
+    private fun isTimeoutPhrase(text: String): Boolean =
+        "timed out" in text || TIMEOUT_WORD.containsMatchIn(text)
+
+    private val TIMEOUT_WORD = Regex("""\btimeouts?\b""")
 }

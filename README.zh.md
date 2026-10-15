@@ -804,6 +804,11 @@ Browser4 自带一个轻量级 **MockSite** 服务器，用于提供静态 HTML 
 **Windows（pwsh —— PowerShell 7+）：** `./bin/test.ps1 mock-site -Dmock.site.port=18080`
 **Linux/macOS：** `./bin/test.sh mock-site -Dmock.site.port=18080`
 
+> **首次运行（Maven 缓存为空）需要 10–15 分钟**（实测约 13 分钟），期间终端没有任何输出：
+> 脚本会依次安装 `browser4-dependencies`，再安装 `browser4-rest` 及其约 25 个模块，每个阶段
+> 完成后才打印一条 `[PASS]` 横幅。构建产物缓存之后启动很快；等待期间不要杀掉进程，也不要
+> 同时启动第二个 Maven 构建。
+
 关键演示页面位于 `http://localhost:18080/generated/`。完整页面列表、环境变量、Python 回退方案和基于 Maven 的启动方式请见 [MockSite](docs/mocksite.md)。测试分类体系与标签系统请见 [Test Taxonomy](docs/TESTING.md)。
 
 ---
