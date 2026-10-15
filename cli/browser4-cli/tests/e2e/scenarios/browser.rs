@@ -3248,6 +3248,168 @@ pub(super) fn test_e2e_console_capture_is_page_silent(ctx: &mut E2ECtx) {
 }
 
 // ---------------------------------------------------------------------------
+// Device emulation persistence — `set device` state must survive `goto`/`resize`
+// ---------------------------------------------------------------------------
+
+/// The viewport the page itself reports, as `<innerWidth>x<innerHeight>@<dpr>`.
+///
+/// Evaluated in the page (not read back from the driver), so every assertion below is
+/// about what a page can observe.  The expression is deliberately page-independent:
+/// the cross-URL leg of the test runs on a fixture that carries no probe of its own.
+fn read_device_metrics(ctx: &mut E2ECtx) -> String {
+    last_non_empty_line(&eval_text(
+        ctx,
+        "innerWidth + 'x' + innerHeight + '@' + devicePixelRatio",
+    ))
+    .to_string()
+}
+
+/// Read the metrics, retrying briefly: an emulation override lands as an asynchronous
+/// viewport change, so a single immediate read can race the commit.
+fn wait_for_device_metrics(ctx: &mut E2ECtx, expected: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut actual = read_device_metrics(ctx);
+    while actual != expected && Instant::now() < deadline {
+        sleep(Duration::from_millis(250));
+        actual = read_device_metrics(ctx);
+    }
+    actual
+}
+
+fn assert_device_metrics(ctx: &mut E2ECtx, expected: &str, why: &str) {
+    let actual = wait_for_device_metrics(ctx, expected);
+    assert_eq!(actual, expected, "{why}");
+}
+
+/// Device metrics survive `goto` and `resize`.
+///
+/// `Emulation.setDeviceMetricsOverride` is replace-only — it overwrites every field and no
+/// CDP call reads the active override back — so the driver memoizes what it applied. Two
+/// regressions a page can observe are pinned here:
+///
+/// * `goto` normalises the viewport, which used to drop the caller's emulation even though
+///   `reload` kept it (an asymmetry with nothing in the output to explain it);
+/// * `resize` re-issued the override with `deviceScaleFactor = 0.0, mobile = false`, so a
+///   resized tab silently came back at dpr 1 and reported success.
+///
+/// The mobile phase runs on `emulation-fixture.html`, which declares `width=device-width`:
+/// with `mobile: true` Chrome honours that meta tag, so the layout viewport follows the
+/// emulated width instead of its 980px mobile default and the reported size stays exact.
+pub(super) fn test_e2e_device_emulation_persistence(ctx: &mut E2ECtx) {
+    reset_cli_artifacts(ctx);
+
+    let emulation_url = ctx.emulation_url();
+    run_command(ctx, &["open", &emulation_url, OPEN_PROFILE_MODE_ARG]);
+    sleep(Duration::from_secs(2));
+
+    // The viewport the browser runs at on its own, for the post-clear comparison.
+    let baseline = read_device_metrics(ctx);
+    assert!(
+        !baseline.is_empty()
+            && baseline != "null"
+            && !baseline.starts_with("500x700")
+            && !baseline.starts_with("390x844"),
+        "the fixture must report the browser's own viewport before any emulation, got: {baseline:?}"
+    );
+
+    // ── 1. `set device` reaches the page and reports what it applied ──────────
+    let applied = run_command(
+        ctx,
+        &[
+            "set", "device", "--width", "500", "--height", "700", "--dpr", "2",
+        ],
+    );
+    assert!(
+        applied.stdout.contains("Device metrics emulated: 500x700 @dpr 2"),
+        "set device must report the metrics it applied, got:\n{}",
+        applied.stdout
+    );
+    assert_device_metrics(
+        ctx,
+        "500x700@2",
+        "the emulated metrics must be what the page sees",
+    );
+
+    // ── 2. a cross-URL `goto` re-applies the active emulation ────────────────
+    let other_url = ctx.other_url();
+    run_command(ctx, &["goto", &other_url]);
+    sleep(Duration::from_secs(2));
+    assert_eq!(
+        last_non_empty_line(&eval_text(ctx, "document.title")),
+        OTHER_TITLE,
+        "the cross-URL navigation must have happened"
+    );
+    assert_device_metrics(
+        ctx,
+        "500x700@2",
+        "`goto` must re-apply the device emulation its viewport normalisation replaces",
+    );
+
+    // The emulation must survive the way back too, and the mobile phase below needs
+    // the fixture's `width=device-width` (Chrome's mobile default is 980px).
+    let back_url = ctx.emulation_url();
+    run_command(ctx, &["goto", &back_url]);
+    sleep(Duration::from_secs(2));
+    assert_device_metrics(
+        ctx,
+        "500x700@2",
+        "the emulation must survive the return navigation as well",
+    );
+
+    // ── 3. `resize` changes the size and keeps the scale factor ──────────────
+    let resized = run_command(ctx, &["resize", "900", "800"]);
+    assert!(
+        resized.stdout.contains("✓ Resized to"),
+        "Expected '✓ Resized to' in resize output:\n{}",
+        resized.stdout
+    );
+    assert_device_metrics(
+        ctx,
+        "900x800@2",
+        "`resize` must carry deviceScaleFactor forward instead of resetting it to dpr 1",
+    );
+
+    // ── 4. the same two paths with the mobile flag on ────────────────────────
+    let mobile = run_command(
+        ctx,
+        &[
+            "set", "device", "--width", "390", "--height", "844", "--dpr", "3", "--mobile",
+        ],
+    );
+    assert!(
+        mobile.stdout.contains("Device metrics emulated: 390x844 @dpr 3, mobile=true"),
+        "set device --mobile must report the mobile flag it applied, got:\n{}",
+        mobile.stdout
+    );
+    assert_device_metrics(
+        ctx,
+        "390x844@3",
+        "a mobile emulation must be visible to the page (the fixture declares width=device-width)",
+    );
+
+    run_command(ctx, &["resize", "600", "620"]);
+    assert_device_metrics(
+        ctx,
+        "600x620@3",
+        "`resize` must keep the mobile emulation's scale factor as well",
+    );
+
+    // ── 5. clearing the override clears the memo ────────────────────────────
+    // `cdp` goes through the same `executeCdpCommand` the memo is written and cleared
+    // by, so the next navigation must stop re-applying the emulation.
+    run_command(ctx, &["cdp", "Emulation.clearDeviceMetricsOverride"]);
+    run_command(ctx, &["goto", &back_url]);
+    sleep(Duration::from_secs(2));
+    assert_device_metrics(
+        ctx,
+        &baseline,
+        "clearing the override must restore the browser's own viewport on the next navigation",
+    );
+
+    run_command(ctx, &["close"]);
+}
+
+// ---------------------------------------------------------------------------
 // agent-browser A/B-tier command gaps — real DOM behaviour on the interactive
 // fixture (the mock scenario covers CLI plumbing; this covers real effects)
 // ---------------------------------------------------------------------------

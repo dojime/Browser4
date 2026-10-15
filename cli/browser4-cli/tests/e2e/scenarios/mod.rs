@@ -1003,6 +1003,19 @@ pub(crate) const SCENARIOS: &[ScenarioDef] = &[
         exclusion_reason: None,
         estimated_duration_ms: None,
     },
+    ScenarioDef {
+        name: "test_e2e_device_emulation_persistence",
+        short_name: "test_device_emulation_persistence",
+        requires_browser4: true,
+        restart_browser4: false,
+        test_count: 1,
+        test_fn: browser::test_e2e_device_emulation_persistence,
+        group: Some("devtools"),
+        level: ScenarioLevel::Basic,
+        exclude_by_default: false,
+        exclusion_reason: None,
+        estimated_duration_ms: None,
+    },
     // ── Mouse fixture scenarios ──────────────────────────────────
     ScenarioDef {
         name: "test_e2e_mouse_click_variants",

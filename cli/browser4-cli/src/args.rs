@@ -436,10 +436,25 @@ pub fn validate_command_options(
     let mut allowed: HashSet<&str> = HashSet::new();
     allowed.insert("_");
     allowed.insert("_.dd");
+    // Parser-internal key the upload builder derives (see UPLOAD_PATHS_KEY).
+    allowed.insert(UPLOAD_PATHS_KEY);
     for opt in def.options {
         allowed.insert(opt.key());
         if let Some(short) = opt.short {
             allowed.insert(short);
+        }
+    }
+    // Positional slots are part of the command's declared surface: the dispatcher
+    // fills them through `build_command_args`, so a populated slot (`open <url>` →
+    // the `url` key) is the command's own argument, not an option the user
+    // mistyped.  Leaving them out rejected every command that takes a positional
+    // (`open`, `goto`, `new-tab`, `crawl`, …) with a bogus "unknown option --url".
+    for arg in def.args {
+        allowed.insert(arg.name);
+    }
+    for (canonical, aliases) in COMMAND_ARG_ALIASES {
+        if def.args.iter().any(|arg| arg.name == *canonical) {
+            allowed.extend(aliases.iter().copied());
         }
     }
     allowed.extend(LATE_GLOBAL_FLAG_KEYS.iter().copied());
@@ -593,6 +608,15 @@ fn unknown_option_error(
 /// - `paths` = JSON array of ALL file paths (used by `upload`'s
 ///   tool_params_fn),
 /// - named options (e.g. `--no-snapshot`) are preserved untouched.
+/// Key [`build_upload_args`] derives for the multi-file tool call: every file
+/// positional as a JSON array.
+///
+/// `upload` declares only two positional slots (`ref`, `file`), so this key is
+/// neither a slot nor an option — it is parser-internal, and
+/// [`validate_command_options`] has to know it or `upload e5 a.txt` is rejected
+/// as "unknown option --paths".
+pub const UPLOAD_PATHS_KEY: &str = "paths";
+
 pub fn build_upload_args(raw: &HashMap<String, Value>) -> Result<HashMap<String, Value>, String> {
     let mut result = raw.clone();
 
@@ -621,7 +645,7 @@ pub fn build_upload_args(raw: &HashMap<String, Value>) -> Result<HashMap<String,
     result.insert("ref".to_string(), json!(positional[0]));
     result.insert("file".to_string(), json!(positional[1]));
     result.insert(
-        "paths".to_string(),
+        UPLOAD_PATHS_KEY.to_string(),
         Value::Array(positional[1..].iter().map(|p| json!(p)).collect()),
     );
 
@@ -1358,6 +1382,71 @@ mod tests {
         assert!(
             error.contains("Supported options: --ignore-case (-i)"),
             "the supported set must be listed: {error}"
+        );
+    }
+
+    #[test]
+    fn test_populated_positional_is_not_an_unknown_option() {
+        // `open <url>` fills the command's `url` slot via `build_command_args`.
+        // Validation that only knew the option table rejected it as
+        // "unknown option --url for 'open'", which broke every command with a
+        // positional argument.
+        let parsed = HashMap::from([
+            ("_".to_string(), json!(["open", "https://example.com"])),
+            ("url".to_string(), json!("https://example.com")),
+        ]);
+        assert_eq!(validate_command_options("open", &parsed), Ok(()));
+
+        // The alias spelling (`--filename` for the `file` slot) is a slot too.
+        let aliased = HashMap::from([
+            ("_".to_string(), json!(["htmlsnapshot", "export", "a.html"])),
+            ("file".to_string(), json!("a.html")),
+            ("filename".to_string(), json!("b.html")),
+        ]);
+        assert_eq!(validate_command_options("htmlsnapshot-export", &aliased), Ok(()));
+    }
+
+    #[test]
+    fn test_upload_derived_paths_key_is_not_an_unknown_option() {
+        // `build_upload_args` derives `paths` from the file positionals and
+        // `upload` declares no such slot, so validation has to ignore it — the
+        // same false positive that rejected `open <url>`.
+        let raw = HashMap::from([(
+            "_".to_string(),
+            json!(["upload", "e5", "a.txt", "b.txt"]),
+        )]);
+        let parsed = build_upload_args(&raw).expect("upload args");
+        assert!(parsed.contains_key(UPLOAD_PATHS_KEY), "parsed: {parsed:?}");
+        assert_eq!(validate_command_options("upload", &parsed), Ok(()));
+    }
+
+    /// Every command must accept the arguments it declares itself.
+    ///
+    /// The regression this pins was invisible to the unit tests because they all
+    /// built their parsed map by hand and left the positional keys out, so a
+    /// validator that ignored positional slots passed them and failed in the
+    /// dispatcher instead (`open <url>` → "unknown option --url").
+    #[test]
+    fn test_every_command_accepts_its_own_declared_arguments() {
+        let commands = crate::commands::commands_map();
+        let mut rejected: Vec<String> = Vec::new();
+        for (name, def) in &commands {
+            let mut parsed: HashMap<String, Value> = HashMap::new();
+            parsed.insert("_".to_string(), json!([name]));
+            for arg in def.args {
+                parsed.insert(arg.name.to_string(), json!("value"));
+            }
+            for opt in def.options {
+                parsed.insert(opt.key().to_string(), json!("value"));
+            }
+            if let Err(error) = validate_command_options(name, &parsed) {
+                rejected.push(format!("{name}: {error}"));
+            }
+        }
+        assert!(
+            rejected.is_empty(),
+            "commands rejected with their own declared arguments:\n{}",
+            rejected.join("\n")
         );
     }
 

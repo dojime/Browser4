@@ -4813,8 +4813,8 @@ fn describe_cdp_application(tool_params: &Value) -> Option<String> {
             }
         }
         "Emulation.setDeviceMetricsOverride" => format!(
-            "Device metrics emulated: {}x{} @dpr {}, mobile={} (device metrics are dropped by \
-             `goto` and `resize`)",
+            "Device metrics emulated: {}x{} @dpr {}, mobile={} (survives `goto` and \
+             `resize`; clear with `cdp Emulation.clearDeviceMetricsOverride`)",
             number("width"),
             number("height"),
             number("deviceScaleFactor"),
