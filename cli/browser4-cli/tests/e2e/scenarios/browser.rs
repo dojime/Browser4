@@ -1010,18 +1010,20 @@ pub(super) fn test_eval_return_types(ctx: &mut E2ECtx) {
     );
 
     // --- undefined ---
-    // `void 0` evaluates to undefined in JS. Some servers serialize
-    // undefined as the empty string, others as "undefined".  The CLI
-    // wraps genuinely empty eval results in quotes to make them visible
-    // on stdout, so accept "undefined", the quoted empty string ("\"\""),
-    // or a genuinely empty trimmed result.
-    // The CLI may append a diagnostic tip on the next line when the result
-    // is empty — only check the first line.
+    // `void 0` evaluates to undefined, and in the default main world the backend
+    // carries it as JSON null, so the CLI prints `null` — the same rendering as JS
+    // `null` (they are indistinguishable in plain output; see references/eval.md).
+    // An isolated-world evaluation arrived as an empty string instead, and the CLI
+    // quotes a genuinely empty result, so accept those spellings too.
+    // The CLI may append a diagnostic tip on the next line — only check the first.
     let undef_val = eval_text(ctx, "void 0");
     let first_line = undef_val.lines().next().unwrap_or("").trim();
     assert!(
-        first_line == "undefined" || first_line.is_empty() || first_line == "\"\"",
-        "Expected undefined, empty string, or quoted-empty for `void 0`, got: {undef_val}"
+        first_line == "null"
+            || first_line == "undefined"
+            || first_line.is_empty()
+            || first_line == "\"\"",
+        "Expected null, undefined, empty string, or quoted-empty for `void 0`, got: {undef_val}"
     );
 
     run_command(ctx, &["close"]);
@@ -3844,8 +3846,9 @@ pub(super) fn test_frame_switch_commands(ctx: &mut E2ECtx) {
     assert!(frames_ready, "pay-frame iframe should load its document");
 
     // ── frames: the frame tree lists every iframe and marks the main frame active
+    // (the command renders a tree, not the backend's JSON — `references/frames.md`)
     let frames_out = run_command(ctx, &["frames"]);
-    for expected in ["payframe", "otherframe", "nestedframe", "frame-pay.html", "\"active\":true"] {
+    for expected in ["payframe", "otherframe", "nestedframe", "frame-pay.html", "[active]"] {
         assert!(
             frames_out.stdout.contains(expected),
             "frames output should contain '{expected}', got:\n{}",
@@ -4080,7 +4083,7 @@ pub(super) fn test_frame_switch_commands(ctx: &mut E2ECtx) {
     goto_interactive_page(ctx);
     let frames_after_nav = run_command(ctx, &["frames"]);
     assert!(
-        frames_after_nav.stdout.contains("\"active\":true"),
+        frames_after_nav.stdout.contains("[active]"),
         "frames after navigation should still list the main frame as active, got:\n{}",
         frames_after_nav.stdout
     );
@@ -4202,18 +4205,22 @@ fn json_field_value(stdout: &str, field: &str) -> Option<i64> {
     None
 }
 
-/// Extract the CDP frame id of the frame whose `name` equals [name] from a
-/// `frames` command payload (a JSON array of frame objects).
+/// Extract the CDP frame id of the frame whose name equals [name] from `frames`
+/// output, which renders one tree line per frame:
+/// `  └ payframe — http://host/frame-pay.html (id=A8F5…)`.
 fn named_frame_id(stdout: &str, name: &str) -> Option<String> {
-    let start = stdout.find('[')?;
-    let end = stdout.rfind(']')?;
-    let value: serde_json::Value = serde_json::from_str(&stdout[start..=end]).ok()?;
-    let frames = value.as_array()?;
-    frames
-        .iter()
-        .find(|frame| frame.get("name").and_then(|v| v.as_str()) == Some(name))
-        .and_then(|frame| frame.get("id").and_then(|v| v.as_str()))
-        .map(str::to_string)
+    stdout.lines().find_map(|line| {
+        let id_at = line.find("(id=")?;
+        let id_end = line[id_at..].find(')')? + id_at;
+        // The label sits between the tree prefix and the url separator, and may carry
+        // the `[active]` marker.
+        let label = line[..line.find('—')?]
+            .trim_start_matches([' ', '-', '└', '├', '│', '─'])
+            .trim_end()
+            .trim_end_matches("[active]")
+            .trim_end();
+        (label == name).then(|| line[id_at + "(id=".len()..id_end].to_string())
+    })
 }
 
 /// Test that a click reaches the page as trusted input instead of a synthetic DOM event.

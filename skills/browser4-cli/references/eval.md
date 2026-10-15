@@ -46,13 +46,13 @@ The expression is evaluated over CDP against the live page. Input channel and ta
 
 Return-value semantics:
 
-- JS `null` prints as `null`. JS `undefined` is transported by the backend as an **empty
-  string**, so `undefined` and `''` both print as `""` and are **indistinguishable in plain
-  output** (with `--json` both arrive as the JSON string `""`).
+- JS `null` prints as `null`, and so does `undefined` in the default main world: an undefined
+  result is carried as JSON `null`, so the two are **indistinguishable in plain output**. An
+  empty string prints as `""`, which is a third result collapsing into a second rendering.
 - Objects and arrays are serialized as valid JSON.
 - `--json` wraps the result in the CLI's JSON envelope; scalar results become quoted strings, numbers/booleans/null pass through.
-- Do not rely on `undefined` being distinguishable from an empty string — have the expression
-  return an explicit sentinel instead:
+- Do not rely on telling `undefined`, `null` and `''` apart — have the expression return an
+  explicit sentinel instead:
   `eval "typeof x === 'undefined' ? 'MISSING' : x"`.
 - **`console.log()` output is not part of eval's own result** — only the expression's return
   value is printed. Read page logs with `browser4-cli console` (or `errors` for error-level
@@ -64,9 +64,10 @@ Return-value semantics:
   last statement (often `""`). Use `return` (or end with the value); the CLI prints a reminder
   when it detects `console.log` in the expression.
 
-> Note: rendering JS `undefined` as `null` is the expected contract — the CLI's null branch
-> assumes the backend sends the literal text `null`, but the backend transports `undefined` as
-> an empty string, so it lands in the `""` branch instead.
+> Note: the CLI's `null` branch prints the literal text the backend sends. A main-world
+> evaluation of `undefined` is carried as JSON `null`, so it prints `null`; check with
+> `typeof` (or `--json`, where the value passes through as JSON null) when the difference
+> matters.
 
 ### Execution World — Main World by Default, `--world isolated` for the Runtime
 

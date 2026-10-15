@@ -2877,10 +2877,20 @@ pub(super) fn test_agent_browser_command_gaps(ctx: &mut E2ECtx) {
     );
 
     // ── 10. pushstate (synthesizes browser_evaluate) ──────────────────
-    let pushstate = run_command(ctx, &["pushstate", "/new-path"]);
-    assert_eq!(
-        strip_snapshot_output(&pushstate.stdout),
-        "mock evaluation result"
+    // `pushstate` now verifies that the URL actually changed, and this mock answers
+    // `current_url` with the same canned text before and after the push — so the
+    // correct outcome against a static mock is the loud failure, not a silent exit 0.
+    // The happy path (URL really changes) is covered live by
+    // `test_agent_browser_command_gaps_live`.
+    let pushstate = run_command_expecting_failure(
+        ctx,
+        &["pushstate", "/new-path"],
+        "history.pushState did not change the page URL",
+    );
+    assert!(
+        pushstate.stderr.contains("mock response for current_url"),
+        "the failure must name the URL it saw, got:\n{}",
+        pushstate.stderr
     );
 
     // ── 11. highlight (synthesizes browser_evaluate) ──────────────────
@@ -2891,20 +2901,31 @@ pub(super) fn test_agent_browser_command_gaps(ctx: &mut E2ECtx) {
     );
 
     // ── 12. set (CDP emulation) ───────────────────────────────────────
+    // `set` reports what it applied instead of echoing the raw CDP payload (it used to
+    // print the empty result object), so the recorded tool call is what proves the right
+    // CDP method reached the backend.
     let set_geo = run_command(
         ctx,
         &["set", "geo", "--lat=37.7749", "--lon=-122.4194"],
     );
     assert!(
-        set_geo.stdout.contains("Emulation.setGeolocationOverride"),
-        "set geo should call Emulation.setGeolocationOverride, got:\n{}",
+        set_geo
+            .stdout
+            .contains("Geolocation emulated: latitude=37.7749, longitude=-122.4194"),
+        "set geo should report the position it applied, got:\n{}",
         set_geo.stdout
     );
-    assert!(
-        set_geo.stdout.contains("mock-cdp-result"),
-        "set geo output should contain mock-cdp-result, got:\n{}",
-        set_geo.stdout
-    );
+    let geo_call = mock_server
+        .snapshot()
+        .tool_calls
+        .into_iter()
+        .find(|call| {
+            call.tool == "execute_cdp_command"
+                && call.arguments["method"] == "Emulation.setGeolocationOverride"
+        })
+        .unwrap_or_else(|| panic!("set geo should call Emulation.setGeolocationOverride"));
+    assert_eq!(geo_call.arguments["params"]["latitude"], 37.7749);
+    assert_eq!(geo_call.arguments["params"]["longitude"], -122.4194);
 
     // ── 13. window-new (browser_tabs "new" action) ────────────────────
     let window_new = run_command(
