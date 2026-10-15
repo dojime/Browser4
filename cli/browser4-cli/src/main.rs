@@ -29794,10 +29794,13 @@ async fn run(
                 tool_params.clone(),
             )
             .await?;
-            json_field("result", json!(&raw));
-            if json_active() {
-                println!("{}", maybe_pretty_print_json(raw.trim()));
-            } else {
+            // `--json` must stay a single document: the CLI always emits an envelope
+            // under `--json`, so printing the raw payload as well made stdout two JSON
+            // documents (`jq` fails on trailing characters).  The buffer travels in
+            // `output.result` as native JSON — `json_text_or_value` parses it, so
+            // consumers need no second parse.  The table is the human default.
+            json_field("result", json_text_or_value(&raw));
+            if !json_active() {
                 if let Some(count) = dropped {
                     cli_println!("Cleared {} tracked request(s).", count);
                 }
@@ -29922,10 +29925,11 @@ async fn run(
                 tool_params.clone(),
             )
             .await?;
-            json_field("result", json!(&raw));
-            if json_active() {
-                println!("{}", maybe_pretty_print_json(raw.trim()));
-            } else {
+            // Same contract as `network requests`: the routes travel in the envelope's
+            // `output.result` (native JSON), so `--json` stays one parseable document
+            // instead of the payload plus an envelope.
+            json_field("result", json_text_or_value(&raw));
+            if !json_active() {
                 cli_println!("{}", render_network_routes(&raw));
             }
         }

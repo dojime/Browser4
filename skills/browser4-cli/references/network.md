@@ -45,11 +45,13 @@ entries; the oldest are evicted first) and `--clear` empties it.
 
 ### `network requests`
 
-List tracked requests — the backend's full per-request JSON, with
-request/response headers and the raw timing object for every entry, so a busy
-page produces a lot of output. Narrow it with `--filter`/`--type`/`--status`,
-and use `network request <id>` for one entry in detail (that is also the only
-place a response body appears — list entries never carry bodies). Options:
+List tracked requests. The default output is a **compact table**
+(`status  method  type  url` plus the request id in brackets), so a busy page stays
+readable; `--json` prints the CLI's JSON envelope with the full per-request payload
+(headers and the raw timing object) in `output.result`. Narrow the list with
+`--filter`/`--type`/`--status`, and use `network request <id>` for one entry in
+detail (that is also the only place a response body appears — list entries never
+carry bodies). Options:
 
 | Option | Meaning |
 |--------|---------|
@@ -57,12 +59,16 @@ place a response body appears — list entries never carry bodies). Options:
 | `--type <csv>` | CDP resource types, e.g. `xhr,fetch` (also `script`, `document`, `image`, …) |
 | `--method <m>` | HTTP method, e.g. `POST` |
 | `--status <s>` | `200`, `2xx`/`3xx`/`4xx`/`5xx`, a range like `400-499`, or comma-separated combos `2xx,4xx` |
+| `--limit <n>` | Print only the newest `<n>` rows; the header still reports the total and the window |
 | `--clear` | Drop all tracked requests first |
+| `--json` | JSON envelope instead of the table; the buffer is in `output.result` |
 
 ```bash
 browser4-cli network requests
 browser4-cli network requests --filter api/users --status 2xx
 browser4-cli network requests --type xhr,fetch --method POST --status 4xx,5xx
+browser4-cli network requests --limit 20
+browser4-cli --json network requests | jq '.output.result[] | select(.status >= 400) | .url'
 browser4-cli network requests --clear
 ```
 
