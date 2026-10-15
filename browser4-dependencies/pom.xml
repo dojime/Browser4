@@ -562,11 +562,11 @@
              used to be declared in the root pom as well, where nothing consumed it, so bumping the
              root copy silently changed nothing.
 
-             Pinned to the 4.11.25 line so this tree consumes the sibling base checkout
-             (D:\workspace\Browser4\browser4base) directly: the eval-world, device-emulation
-             and frame-scope fixes made there are invisible under the 4.11.24 release pin.
-             Revert to 4.11.24 (or the next release) when the base release ships. -->
-        <browser4-base.version>4.11.25-SNAPSHOT</browser4-base.version>
+             The 4.11.25 release carries the eval-world (JsWorld), device-emulation and frame-scope
+             fixes; 4.11.24 does not.  This tree imports `ai.platon.pulsar.api.JsWorld`, so the pin
+             has to stay on the release that ships it — 4.11.25 was published to Maven Central on
+             2026-10-15. -->
+        <browser4-base.version>4.11.25</browser4-base.version>
         <cdt-kotlin-client.version>4.8.0</cdt-kotlin-client.version>
 
         <!-- Agent memory system: SQLite FTS derived index (design: docs-dev/copilot/robust-browser-agent-memory-system-design.md) -->
